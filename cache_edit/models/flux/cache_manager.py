@@ -38,6 +38,8 @@ class FluxCacheManager(BaseCacheManager):
         total_step_num: int = 30,
         threshold: float = 0.97,
         cache_interval: int = 5,
+        gpu_memory_limit_gb: Optional[float] = None,
+        gpu_memory_buffer_gb: float = 1.0,
     ):
         """
         初始化 Flux 缓存管理器。
@@ -49,7 +51,9 @@ class FluxCacheManager(BaseCacheManager):
             num_gpus: 可用 GPU 数量
             total_step_num: 总推理步数
             threshold: key_token 选择的余弦相似度阈值
-            cache_interval: 缓存间隔
+            cache_interval: 缓存间隔（步数）；值越小缓存越密集，显存占用越大
+            gpu_memory_limit_gb: 每张 GPU 的显存上限（GB），None 时自动查询
+            gpu_memory_buffer_gb: 显存预留 buffer（GB），防止 OOM
         """
         super().__init__(
             use_activation_cache=use_activation_cache,
@@ -61,7 +65,13 @@ class FluxCacheManager(BaseCacheManager):
         )
 
         self.num_gpus = num_gpus
+        self.gpu_memory_limit_gb = gpu_memory_limit_gb
+        self.gpu_memory_buffer_gb = gpu_memory_buffer_gb
         self.stream_type: StreamType = "single"
+
+        # 自动查询 GPU 显存上限
+        if self.gpu_memory_limit_gb is None and torch.cuda.is_available():
+            self._auto_detect_gpu_limits()
 
         # Flux 的缓存以 (stream, step, layer_idx) 为键，单层结构（无 cond/uncond 双模式）
         self.prev_cache: Dict[Tuple[StreamType, int, int], Tensor] = {}
@@ -80,6 +90,23 @@ class FluxCacheManager(BaseCacheManager):
         # 排序后的 cache_steps（供 bisect 使用）
         self._refresh_cache_steps_sorted()
         print(f"[FluxCacheManager] Initialized cache_steps: {self.cache_steps}")
+
+    def _auto_detect_gpu_limits(self) -> None:
+        """自动检测各 GPU 的显存总量，设置为 limit（留 buffer）。"""
+        if self.num_gpus <= 0:
+            return
+        try:
+            # 查询第一张卡的总显存作为默认值
+            props = torch.cuda.get_device_properties(0)
+            total_gb = props.total_memory / (1024**3)
+            self.gpu_memory_limit_gb = total_gb
+            print(
+                f"[FluxCacheManager] Auto-detected GPU memory: {total_gb:.1f} GB "
+                f"(buffer: {self.gpu_memory_buffer_gb:.1f} GB)"
+            )
+        except Exception as e:
+            print(f"[FluxCacheManager] Failed to auto-detect GPU memory: {e}")
+            self.gpu_memory_limit_gb = 77.0  # fallback
 
     # ---------- cache_steps 管理 ----------
 
@@ -100,6 +127,8 @@ class FluxCacheManager(BaseCacheManager):
         cache_device: Optional[torch.device] = None,
         cache_interval: Optional[int] = None,
         num_gpus: Optional[int] = None,
+        gpu_memory_limit_gb: Optional[float] = None,
+        gpu_memory_buffer_gb: Optional[float] = None,
     ) -> None:
         """
         动态更新参数（兼容关键字调用与 argparse 风格调用）。
@@ -108,8 +137,10 @@ class FluxCacheManager(BaseCacheManager):
             num_inference_steps: 推理步数
             threshold: 相似度阈值
             cache_device: 缓存设备
-            cache_interval: 缓存间隔
+            cache_interval: 缓存间隔（值越小缓存越密集）
             num_gpus: GPU 数量
+            gpu_memory_limit_gb: GPU 显存上限（GB）
+            gpu_memory_buffer_gb: 显存预留 buffer（GB）
         """
         super().set_parameters(
             num_inference_steps=num_inference_steps,
@@ -119,6 +150,10 @@ class FluxCacheManager(BaseCacheManager):
         )
         if num_gpus is not None:
             self.num_gpus = num_gpus
+        if gpu_memory_limit_gb is not None:
+            self.gpu_memory_limit_gb = gpu_memory_limit_gb
+        if gpu_memory_buffer_gb is not None:
+            self.gpu_memory_buffer_gb = gpu_memory_buffer_gb
         self._refresh_cache_steps_sorted()
         print(f"[FluxCacheManager] Updated cache_steps: {self.cache_steps}")
 
@@ -169,11 +204,14 @@ class FluxCacheManager(BaseCacheManager):
     def gpu_has_space(
         self, device: torch.device, extra_bytes: int, limit_gb: float
     ) -> bool:
-        """检查指定 GPU 是否有足够空间（预留 1GB buffer）。"""
-        used = torch.cuda.memory_allocated(device)
+        """检查指定 GPU 是否有足够空间（预留 buffer）。"""
+        # Use memory_reserved (includes PyTorch's memory pool) instead of
+        # memory_allocated (only active tensors) for more accurate check
+        used = torch.cuda.memory_reserved(device)
         limit_bytes = int(limit_gb * 1024**3)
-        buffer_bytes = int(1 * 1024**3)
-        return used + extra_bytes + buffer_bytes <= limit_bytes
+        buffer_bytes = int(self.gpu_memory_buffer_gb * 1024**3)
+        available = limit_bytes - used - buffer_bytes
+        return available >= extra_bytes
 
     def _select_device(self, extra_bytes: int) -> torch.device:
         """
@@ -184,18 +222,16 @@ class FluxCacheManager(BaseCacheManager):
             return start_dev
 
         start_idx = start_dev.index if start_dev.index is not None else 0
-
-        def get_limit_gb(_device_idx: int) -> float:
-            return 77.0
+        limit_gb = self.gpu_memory_limit_gb or 77.0
 
         for dev_idx in range(start_idx, self.num_gpus):
             dev = torch.device(f"cuda:{dev_idx}")
-            if self.gpu_has_space(dev, extra_bytes, get_limit_gb(dev_idx)):
+            if self.gpu_has_space(dev, extra_bytes, limit_gb):
                 return dev
 
         for dev_idx in range(0, start_idx):
             dev = torch.device(f"cuda:{dev_idx}")
-            if self.gpu_has_space(dev, extra_bytes, get_limit_gb(dev_idx)):
+            if self.gpu_has_space(dev, extra_bytes, limit_gb):
                 return dev
 
         print(
@@ -234,6 +270,14 @@ class FluxCacheManager(BaseCacheManager):
         key = (stream, self.current_step, layer_idx)
         extra_bytes = tensor.numel() * tensor.element_size()
         target_device = self._select_device(extra_bytes)
+
+        # Debug: log cross-GPU placement
+        if target_device != self.cache_device:
+            print(
+                f"[Cache] step={self.current_step} layer={layer_idx} "
+                f"→ {target_device} (overflow from {self.cache_device})"
+            )
+
         self.new_cache[key] = tensor.to(target_device)
 
     def get_activation(

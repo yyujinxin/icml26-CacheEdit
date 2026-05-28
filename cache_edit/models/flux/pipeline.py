@@ -543,8 +543,21 @@ def create_default_cache_manager(
     cache_interval: int = 5,
     cache_device: Optional[torch.device] = None,
     num_gpus: int = 1,
+    gpu_memory_limit_gb: Optional[float] = None,
+    gpu_memory_buffer_gb: float = 1.0,
 ) -> FluxCacheManager:
-    """创建一组合理默认参数的 FluxCacheManager。"""
+    """
+    创建一组合理默认参数的 FluxCacheManager。
+
+    Args:
+        num_inference_steps: 推理步数
+        threshold: key-token 相似度阈值
+        cache_interval: 缓存间隔（步数），值越小缓存越密集
+        cache_device: 起始缓存设备，None 时自动选择
+        num_gpus: 可用 GPU 数量，用于多卡显存分配
+        gpu_memory_limit_gb: 每张 GPU 显存上限（GB），None 时自动检测
+        gpu_memory_buffer_gb: 显存预留 buffer（GB），防止 OOM
+    """
     if cache_device is None:
         cache_device = torch.device(
             "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -557,4 +570,6 @@ def create_default_cache_manager(
         threshold=threshold,
         cache_interval=cache_interval,
         num_gpus=num_gpus,
+        gpu_memory_limit_gb=gpu_memory_limit_gb,
+        gpu_memory_buffer_gb=gpu_memory_buffer_gb,
     )
