@@ -115,7 +115,12 @@ class BaseConfig:
 
     def merge(self: T, other: Union[T, Dict[str, Any]]) -> T:
         """
-        合并另一个配置，other 的非 None 字段会覆盖当前配置。
+        合并另一个配置，other 中显式给出的字段会覆盖当前配置。
+
+        若 other 是字典，仅出现在字典中的键参与覆盖；嵌套 dataclass 字段
+        会递归合并，未出现的子字段保留 self 中的值。
+
+        若 other 是 dataclass 实例，所有非 None 字段覆盖当前配置。
 
         Args:
             other: 另一个配置实例或字典
@@ -124,14 +129,30 @@ class BaseConfig:
             合并后的新配置实例
         """
         if isinstance(other, dict):
-            other = self.__class__.from_dict(other)
+            merged_data = {}
+            for f in fields(self):
+                self_val = getattr(self, f.name)
+                if f.name not in other:
+                    merged_data[f.name] = self_val
+                    continue
+                other_val = other[f.name]
+                if (
+                    hasattr(f.type, "__dataclass_fields__")
+                    and isinstance(other_val, dict)
+                ):
+                    merged_data[f.name] = self_val.merge(other_val)
+                else:
+                    merged_data[f.name] = (
+                        other_val if other_val is not None else self_val
+                    )
+            return self.__class__(**merged_data)
 
+        # other 是 dataclass 实例
         merged_data = {}
         for f in fields(self):
             self_val = getattr(self, f.name)
             other_val = getattr(other, f.name)
 
-            # 递归合并嵌套 dataclass
             if (
                 hasattr(f.type, "__dataclass_fields__")
                 and self_val is not None
@@ -139,7 +160,6 @@ class BaseConfig:
             ):
                 merged_data[f.name] = self_val.merge(other_val)
             else:
-                # other 的非 None 值优先
                 merged_data[f.name] = (
                     other_val if other_val is not None else self_val
                 )
