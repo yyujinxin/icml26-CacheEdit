@@ -62,11 +62,12 @@ Issues = "https://github.com/your-org/cache-edit/issues"
 [project.scripts]
 cache-edit = "cache_edit.cli.main:main"
 
-[tool.setuptools]
-packages = ["cache_edit"]
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["cache_edit*"]
 
 [tool.setuptools.package-data]
-cache_edit = ["py.typed"]
+"cache_edit" = ["py.typed"]
 
 [tool.black]
 line-length = 100
