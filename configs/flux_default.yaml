@@ -1,0 +1,34 @@
+# Flux Kontext Model Default Configuration
+
+model:
+  model_path: "black-forest-labs/FLUX.1-dev"
+  device: "cuda"
+  dtype: "bfloat16"
+  device_map: null
+
+cache:
+  threshold: 0.97
+  cache_interval: 5
+  enable_stats: true
+  use_activation_cache: true
+  num_gpus: 1
+
+pipeline:
+  num_inference_steps: 28
+  guidance_scale: 3.5
+  height: 1024
+  width: 1024
+  max_sequence_length: 512
+  true_cfg: true
+
+viz:
+  enable: false
+  gen_dir: null
+  viz_out_dir: null
+  csv_out_path: null
+  edit_ratio_summary_candidates: []
+  rounds_per_image: 7
+  ref_layer_idx: 37
+  ref_stream: "single"
+
+output_dir: "./outputs/flux"
