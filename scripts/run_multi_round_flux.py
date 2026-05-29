@@ -55,20 +55,22 @@ def extract_instructions(row: dict):
 
 
 def build_pipeline(args):
-    if not args.use_cache:
-        # No-cache baseline: stock pipeline, no transformer patching.
-        from diffusers import FluxKontextPipeline
-
-        pipeline = FluxKontextPipeline.from_pretrained(
-            args.model_path, torch_dtype=torch.bfloat16
-        ).to(args.device)
-        pipeline.set_progress_bar_config(disable=False)
-        return pipeline, None
-
     from cache_edit.models.flux import (
         create_default_cache_manager,
         init_flux_pipeline,
     )
+
+    if not args.use_cache:
+        # No-cache baseline: use CacheFluxKontextPipeline but without cache_context
+        # to preserve resolution auto-adjustment logic
+        pipeline = init_flux_pipeline(
+            model_path=args.model_path,
+            device=args.device,
+            dtype=torch.bfloat16,
+            cache_manager=None,  # No caching
+        )
+        pipeline.set_progress_bar_config(disable=False)
+        return pipeline, None
 
     cache_manager = create_default_cache_manager(
         num_inference_steps=args.num_inference_steps,

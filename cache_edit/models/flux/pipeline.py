@@ -501,35 +501,36 @@ def init_flux_pipeline(
             model_path, torch_dtype=dtype
         )
 
-    # 替换 transformer.forward
-    pipeline.transformer.forward = cache_flux_transformer_2d_forward.__get__(
-        pipeline.transformer, pipeline.transformer.__class__
-    )
-
-    # 替换 block forward + 设置 processor
-    if install_block_forward_hooks:
-        for block in pipeline.transformer.transformer_blocks:
-            block.workspace = {}
-            block.forward = cache_flux_transformer_block_forward.__get__(
-                block, block.__class__
-            )
-        for block in pipeline.transformer.single_transformer_blocks:
-            block.workspace = {}
-            block.forward = cache_flux_single_transformer_block_forward.__get__(
-                block, block.__class__
-            )
-
-    if use_cache_processor:
-        for block in pipeline.transformer.transformer_blocks:
-            block.attn.set_processor(FluxAttnCacheProcessor())
-        for block in pipeline.transformer.single_transformer_blocks:
-            block.attn.set_processor(FluxAttnCacheProcessor())
-
+    # Only install cache hooks if cache_manager is provided
     if cache_manager is not None:
+        # 替换 transformer.forward
+        pipeline.transformer.forward = cache_flux_transformer_2d_forward.__get__(
+            pipeline.transformer, pipeline.transformer.__class__
+        )
+
+        # 替换 block forward + 设置 processor
+        if install_block_forward_hooks:
+            for block in pipeline.transformer.transformer_blocks:
+                block.workspace = {}
+                block.forward = cache_flux_transformer_block_forward.__get__(
+                    block, block.__class__
+                )
+            for block in pipeline.transformer.single_transformer_blocks:
+                block.workspace = {}
+                block.forward = cache_flux_single_transformer_block_forward.__get__(
+                    block, block.__class__
+                )
+
+        if use_cache_processor:
+            for block in pipeline.transformer.transformer_blocks:
+                block.attn.set_processor(FluxAttnCacheProcessor())
+            for block in pipeline.transformer.single_transformer_blocks:
+                block.attn.set_processor(FluxAttnCacheProcessor())
+
         pipeline.attach_cache_context(cache_manager)
 
-    if viz_config is not None:
-        pipeline.attach_viz_config(viz_config)
+        if viz_config is not None:
+            pipeline.attach_viz_config(viz_config)
 
     if device_map is None:
         pipeline = pipeline.to(device)
