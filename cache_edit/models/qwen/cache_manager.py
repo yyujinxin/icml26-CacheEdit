@@ -245,3 +245,58 @@ class QwenCacheManager(BaseCacheManager):
             "uncond_cache_size": len(self.prev_cache.get("uncond", {})),
         })
         return stats
+
+    # Processor 接口方法
+    def should_compute_kv(self) -> bool:
+        """
+        判断是否需要计算 K/V。
+
+        Qwen 策略：
+        - Round 0：总是计算（需要建立缓存）
+        - Round 1+：
+          - 缓存步：不计算（复用缓存）
+          - 非缓存步：计算（没有缓存可用）
+
+        Returns:
+            bool: True 表示需要计算新的 K/V
+        """
+        if self.is_round0:
+            return True
+        # Round 1+：缓存步不计算，非缓存步计算
+        return not self.should_cache(self.current_step)
+
+    def should_store_kv(self) -> bool:
+        """
+        判断是否需要存储 K/V 到缓存。
+
+        Qwen 策略：
+        - Round 0 的缓存步：存储
+        - 其他情况：不存储
+
+        Returns:
+            bool: True 表示需要存储
+        """
+        return self.is_round0 and self.should_cache(self.current_step)
+
+    def should_reuse_kv(self) -> bool:
+        """
+        判断是否应该复用缓存的 K/V。
+
+        Qwen 策略：
+        - Round 1+ 的缓存步：复用
+        - 其他情况：不复用
+
+        Returns:
+            bool: True 表示应该复用缓存
+        """
+        return (not self.is_round0) and self.should_cache(self.current_step)
+
+    def get_selection_ids(self) -> Optional[Tensor]:
+        """
+        获取需要部分更新的 token 索引（关键 token）。
+
+        Returns:
+            Optional[Tensor]: 关键 token 索引，None 表示全部复用
+        """
+        # 返回当前 mode 的关键 token 索引
+        return self.key_token_indices.get(self.current_mode, None)
