@@ -1,6 +1,33 @@
+# Python
 __pycache__/
 *.pyc
-.env
-.venv/
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+*.egg
 dist/
 build/
+
+# Virtual env
+.env
+.venv/
+venv/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Generated artifacts (large, reproducible from scripts)
+outputs/
+*.log
+
+# Legacy reference scripts (kept locally, not tracked)
+Flux-kontext/
+Qwen-image-edit-plus/
+
+# Dev notes
+plan.md
+progress.md

@@ -1,0 +1,22 @@
+# Qwen Model Default Configuration
+
+model:
+  model_path: "Qwen/Qwen2-VL-7B-Instruct"
+  device: "cuda"
+  dtype: "bfloat16"
+  device_map: null
+
+cache:
+  threshold: 0.1
+  cache_interval: 5
+  enable_stats: true
+  use_activation_cache: true
+
+pipeline:
+  num_inference_steps: 50
+  guidance_scale: 4.0
+  height: 1024
+  width: 1024
+  max_sequence_length: 512
+
+output_dir: "./outputs/qwen"
