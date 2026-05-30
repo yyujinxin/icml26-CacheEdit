@@ -56,6 +56,10 @@ class QwenDoubleStreamCacheAttnProcessor:
         self.k_cache: dict = {"cond": None, "uncond": None}
         self.v_cache: dict = {"cond": None, "uncond": None}
 
+        # Debug counters
+        self.compute_count = 0
+        self.reuse_count = 0
+
     def attach_cache_context(self, cache_context) -> None:
         """
         附加缓存上下文。
@@ -101,6 +105,7 @@ class QwenDoubleStreamCacheAttnProcessor:
 
         # 通过缓存上下文决定行为
         if ctx.should_compute_kv():
+            self.compute_count += 1
             img_key = attn.to_k(hidden_states)
             img_value = attn.to_v(hidden_states)
 
@@ -112,6 +117,7 @@ class QwenDoubleStreamCacheAttnProcessor:
             return img_key, img_value
 
         elif ctx.should_reuse_kv() and self.k_cache[tag] is not None:
+            self.reuse_count += 1
             # 复用缓存（可能需要部分更新）
             selection_ids = ctx.get_selection_ids()
             if selection_ids is not None:
@@ -120,6 +126,7 @@ class QwenDoubleStreamCacheAttnProcessor:
                     attn, hidden_states, tag, selection_ids
                 )
             else:
+                # 完全复用缓存（跳过 to_k/to_v 计算）
                 img_key = self.k_cache[tag]
                 img_value = self.v_cache[tag]
             return img_key, img_value

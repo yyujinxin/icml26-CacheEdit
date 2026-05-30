@@ -103,6 +103,18 @@ class BaseCacheManager(ABC):
         if step == 0:
             self.current_round += 1
 
+    def on_round_start(self):
+        """
+        在每轮编辑开始前调用 (在 pipeline 调用之前)。
+        重置 current_step=0 并递增 current_round。
+        """
+        self.current_step = 0
+        self.current_round += 1
+
+    def advance_step(self):
+        """Advance internal step counter (called from transformer forward end)."""
+        self.current_step += 1
+
     def should_cache(self, step: int) -> bool:
         """
         判断当前步骤是否需要缓存激活。

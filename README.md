@@ -1,117 +1,168 @@
 # CacheEdit
 
-高效的扩散模型图像编辑缓存优化框架。
+Efficient activation caching for multi-round diffusion-based image editing.
 
-CacheEdit 通过在多轮图像编辑过程中智能缓存中间激活（activation），减少冗余计算，
-从而加速 Qwen 与 Flux Kontext 的推理。
+CacheEdit accelerates **Qwen-Image-Edit** and **FLUX.1-Kontext** in multi-round
+editing scenarios by caching transformer-block activations across rounds and
+reusing them for tokens whose hidden state hasn't meaningfully changed
+(Flux-style key-token mechanism with **dynamic per-step refresh**).
 
-## 特性
+## Features
 
-- **多后端支持**：Qwen 图像编辑 与 Flux Kontext 两套 pipeline
-- **智能激活缓存**：基于相似度阈值与缓存间隔，跨步/跨轮复用注意力激活
-- **关键 token 机制（Flux）**：仅对变化显著的 token 重算，其余复用缓存
-- **多 GPU 缓存放置**：缓存张量按可用显存自动选择设备
-- **统一配置系统**：dataclass + YAML/JSON，支持环境变量覆盖
-- **命令行工具**：`cache-edit edit` 单图编辑，`cache-edit benchmark` 测速对比
+- **Two backends**: Qwen-Image-Edit and FLUX.1-Kontext pipelines
+- **Activation cache + dynamic key-token refresh**: at every cache step in
+  Round 1+, the manager compares the current hidden state against the cached
+  reference from Round 0, and **re-computes `key_token_indices` on the fly** —
+  so the "edit region" mask adapts to each round's prompt and to denoising
+  progress within the round
+- **Partial computation at reuse steps**: image tokens are rearranged so key
+  tokens sit at the front, sliced down to K, and only K go through the 60
+  transformer blocks; non-key positions are restitched from the per-layer cache
+- **CFG-aware cache (Qwen)**: separate cond / uncond caches with correct step
+  counting under true CFG (`true_cfg_scale > 1`)
+- **Multi-GPU placement**: cache tensors are distributed across cards based on
+  measured free memory, never on the model device
+- **Unified config**: dataclass + YAML/JSON, with environment-variable overrides
 
-## 安装
+## Installation
 
 ```bash
-# 从源码安装（开发模式）
-git clone <repo-url>
+git clone https://github.com/yyujinxin/icml26-CacheEdit.git
 cd icml26-CacheEdit
 pip install -e .
 ```
 
-依赖 `torch`、`diffusers`、`transformers`、`Pillow`、`pyyaml`。
-模型相关依赖见 `Qwen-image-edit-plus/requirements.txt` 与 `Flux-kontext/requirements.txt`。
+Runtime: `torch`, `diffusers >= 0.35`, `transformers`, `Pillow`, `pyyaml`.
 
-## 快速开始
+## Quick start
 
-### 命令行
+### Multi-round Qwen (CFG enabled, dynamic key-token cache)
 
 ```bash
-# 单图编辑（Flux Kontext）
-cache-edit edit --model flux \
-  --image input.png \
-  --prompt "add a red hat" \
-  --output out.png
+python scripts/run_multi_round_qwen.py \
+    --model-path /path/to/Qwen-Image-Edit \
+    --image-idx 0000 \
+    --num-inference-steps 30 \
+    --cache-interval 5 \
+    --num-gpus 4 \
+    --use-cache \
+    --true-cfg-scale 4.0 \
+    --negative-prompt " "
+```
 
-# 使用自定义配置 + 测速对比缓存收益
-cache-edit benchmark --model qwen \
-  --image input.png \
-  --prompt "make it sunset" \
-  --config configs/qwen_default.yaml \
-  --rounds 3
+Compared to the no-cache baseline (same CFG settings), the cache run is
+roughly **3.4× faster on subsequent rounds** at the default `cache-interval=5`.
+
+### Multi-round Flux Kontext
+
+```bash
+python scripts/run_multi_round_flux.py \
+    --model-path /path/to/FLUX.1-Kontext-dev \
+    --image-idx 0000 \
+    --num-inference-steps 28 \
+    --cache-interval 5 \
+    --num-gpus 4 \
+    --use-cache
 ```
 
 ### Python API
 
 ```python
 import torch
-from cache_edit.models.qwen import init_qwen_pipeline, create_default_cache_manager
+from PIL import Image
+from cache_edit.models.qwen import (
+    create_default_cache_manager,
+    init_qwen_pipeline,
+)
 
 cache_manager = create_default_cache_manager(
-    num_inference_steps=50,
-    threshold=0.1,
+    num_inference_steps=30,
+    threshold=0.99,
     cache_interval=5,
+    cache_device=torch.device("cuda:0"),
+    num_gpus=4,
 )
+# CFG doubles transformer calls per step (cond + uncond) — tell the manager.
+cache_manager.calls_per_step = 2
+
 pipeline = init_qwen_pipeline(
-    model_path="Qwen/Qwen2-VL-7B-Instruct",
-    device="cuda",
+    model_path="/path/to/Qwen-Image-Edit",
+    device="cuda:0",
     dtype=torch.bfloat16,
     cache_manager=cache_manager,
 )
 
-from PIL import Image
-result = pipeline(
-    image=Image.open("input.png").convert("RGB"),
-    prompt="make it sunset",
-    num_inference_steps=50,
-)
-result.images[0].save("out.png")
+img = Image.open("input.png").convert("RGB")
+for prompt in ["make the cat fluffier", "add a red collar", "change the bg"]:
+    cache_manager.on_round_start()
+    out = pipeline(
+        image=img,
+        prompt=prompt,
+        num_inference_steps=30,
+        true_cfg_scale=4.0,
+        negative_prompt=" ",
+    ).images[0]
+    img = out  # feed into next round
+    cache_manager.flush_activation_cache()
 ```
 
-## 配置
+## How the cache works
 
-默认配置位于 `configs/`：
+1. **Round 0** — full computation; every cache step stores per-layer image and
+   text activations to `prev_activation_cache` (under `(mode, stream, layer,
+   step)` key).
+2. **Round 1+ cache step** — full computation again, but after the last block
+   it compares the current hidden state with the Round 0 cache at the same
+   step. Tokens whose cosine similarity falls below `threshold` are recorded as
+   `key_token_indices` for subsequent reuse steps.
+3. **Round 1+ reuse step** — image tokens are rearranged so key positions sit
+   at the front, then sliced to K tokens. All 60 transformer blocks run on the
+   short sequence; after each block the cached non-key positions are pulled
+   from the previous round's per-layer cache and concatenated back to the full
+   length. Order is restored before `proj_out`.
+
+Higher `cache_interval` → more reuse steps → bigger speedup, but the key-token
+set is computed less often. The right setting depends on how local your edits
+are.
+
+## Config
+
+Default configs live in `configs/`:
 
 - `configs/qwen_default.yaml`
 - `configs/flux_default.yaml`
 
-可用环境变量覆盖任意字段（前缀 `CACHEEDIT_`，嵌套字段用双下划线）：
+Override any field via environment variables (prefix `CACHEEDIT_`, nested with
+double underscores):
 
 ```bash
-export CACHEEDIT_CACHE__THRESHOLD=0.95
-export CACHEEDIT_MODEL__DEVICE=cuda:1
+export CACHEEDIT_CACHE__THRESHOLD=0.99
+export CACHEEDIT_MODEL__DEVICE=cuda:0
 ```
 
-详见 [配置文档](docs/API.md#config-配置)。
+## CLI
 
-## CLI 参考
-
-| 命令 | 说明 |
+| Command | Description |
 | --- | --- |
-| `cache-edit edit` | 用文本指令编辑单张图像 |
-| `cache-edit benchmark` | 对比开/关缓存的推理延迟与加速比 |
-| `cache-edit --version` | 打印版本 |
+| `cache-edit edit` | Edit a single image with a text instruction |
+| `cache-edit benchmark` | Compare latency with/without the cache |
+| `cache-edit --version` | Print version |
 
-运行 `cache-edit edit --help` / `cache-edit benchmark --help` 查看完整参数。
+See `cache-edit edit --help` for the full parameter list.
 
-## 文档
+## Docs
 
-- [API 文档](docs/API.md)
-- [使用教程](docs/TUTORIAL.md)
+- [API reference](docs/API.md)
+- [Tutorial](docs/TUTORIAL.md)
 
-## 开发
+## Development
 
 ```bash
-# 运行测试
 pytest tests/ -v
 ```
 
-CI 通过 GitHub Actions 在 Python 3.8–3.11 上运行测试（见 `.github/workflows/test.yml`）。
+CI runs the test suite on Python 3.8–3.11 (see `.github/workflows/test.yml`).
 
-## 许可证
+## License
 
-见仓库 LICENSE。
+See `LICENSE`.

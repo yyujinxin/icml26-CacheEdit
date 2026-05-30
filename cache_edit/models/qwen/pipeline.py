@@ -10,8 +10,7 @@ except ImportError:
     QwenImageEditPipeline = None
 
 from cache_edit.models.qwen.cache_manager import QwenCacheManager
-from cache_edit.models.qwen.scheduler import QwenRegionAwareScheduler
-from cache_edit.models.qwen.processor import QwenDoubleStreamCacheAttnProcessor
+from cache_edit.models.qwen.transformer_forward import cache_qwen_transformer_2d_forward
 
 
 def init_qwen_pipeline(
@@ -19,25 +18,22 @@ def init_qwen_pipeline(
     device: Union[str, torch.device] = "cuda",
     dtype: torch.dtype = torch.bfloat16,
     cache_manager: Optional[QwenCacheManager] = None,
-    use_region_aware_scheduler: bool = True,
-    use_cache_processor: bool = True,
+    use_activation_cache: bool = True,
 ):
     """
-    创建并初始化 Qwen 图像编辑 Pipeline（带缓存优化）。
+    创建并初始化 Qwen 图像编辑 Pipeline（带激活缓存优化）。
 
     该工厂函数负责：
     1. 加载预训练 Pipeline
-    2. 替换为区域感知调度器（可选）
-    3. 替换为带缓存的注意力处理器（可选）
-    4. 附加缓存管理器
+    2. 替换 transformer forward 为带激活缓存的版本（类似 Flux）
+    3. 附加缓存管理器
 
     Args:
         model_path: 预训练模型路径或 HuggingFace ID
         device: 目标设备
         dtype: 数据类型
         cache_manager: 缓存管理器实例，None 表示不使用缓存
-        use_region_aware_scheduler: 是否使用区域感知调度器
-        use_cache_processor: 是否使用带缓存的注意力处理器
+        use_activation_cache: 是否使用激活缓存（Flux 风格）
 
     Returns:
         QwenImageEditPipeline: 配置好的 pipeline
@@ -63,23 +59,17 @@ def init_qwen_pipeline(
     # 1. 加载基础 pipeline
     pipeline = QwenImageEditPipeline.from_pretrained(model_path, torch_dtype=dtype)
 
-    # 2. 替换调度器
-    if use_region_aware_scheduler:
-        pipeline.scheduler = QwenRegionAwareScheduler.from_config(
-            pipeline.scheduler.config
+    # 2. 如果启用缓存，替换 transformer forward
+    if cache_manager is not None and use_activation_cache:
+        # 附加缓存管理器到 transformer
+        pipeline.transformer.cache_manager = cache_manager
+
+        # 替换 transformer forward 为带激活缓存的版本
+        pipeline.transformer.forward = cache_qwen_transformer_2d_forward.__get__(
+            pipeline.transformer, pipeline.transformer.__class__
         )
-        if cache_manager is not None:
-            pipeline.scheduler.attach_cache_manager(cache_manager)
 
-    # 3. 替换注意力处理器
-    if use_cache_processor:
-        for block in pipeline.transformer.transformer_blocks:
-            processor = QwenDoubleStreamCacheAttnProcessor(single=False)
-            if cache_manager is not None:
-                processor.attach_cache_context(cache_manager)
-            block.attn.set_processor(processor)
-
-    # 4. 移到目标设备
+    # 3. 移到目标设备
     pipeline = pipeline.to(device)
 
     return pipeline
