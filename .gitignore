@@ -22,6 +22,7 @@ venv/
 
 # Generated artifacts (large, reproducible from scripts)
 outputs/
+legacy/
 *.log
 
 # Legacy reference scripts (kept locally, not tracked)
