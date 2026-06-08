@@ -1,7 +1,9 @@
 """Flux activation cache manager implementation."""
 
+import threading
 import time
 from bisect import bisect_right
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import torch
@@ -97,6 +99,15 @@ class FluxCacheManager(BaseCacheManager):
         self._decoded_gop_cache: Dict[Tuple[int, str], List[Tensor]] = {}
         self._decoded_gop_access_order: List[Tuple[int, str]] = []
         self._decoded_gop_max_entries = 2
+        self._gop_prefetch_window = 2
+        self._gop_prefetch_lock = threading.RLock()
+        self._gop_decode_lock = threading.Lock()
+        self._gop_prefetch_executor: Optional[ThreadPoolExecutor] = None
+        self._gop_prefetch_plan: List[Dict[str, Any]] = []
+        self._gop_prefetch_next_index = 0
+        self._gop_prefetch_target_step: Optional[int] = None
+        self._gop_prefetch_futures: Dict[Tuple[int, str], Future] = {}
+        self._gop_prefetch_records: List[Dict[str, Any]] = []
         if self.use_compression:
             try:
                 from cache_edit.compression.activation_compressor import (
@@ -225,13 +236,33 @@ class FluxCacheManager(BaseCacheManager):
     def on_step_start(self, step: int) -> None:
         """每 step 起始钩子；step==0 时进入新一轮。"""
         self._flush_pending_compression_group()
-        self._clear_decoded_gop_cache()
+        keep_prefetch = self._gop_prefetch_target_step == int(step)
+        if not keep_prefetch:
+            self._reset_gop_prefetch_state(wait=True)
+            self._clear_decoded_gop_cache()
         super().on_step_start(step)
         if step == 0:
             self._rearranged_pe_cache = None
             self._rearranged_pe_cache_version = -1
             self._restore_masks = None
             self._prev_mask_cache = None
+        if self._gop_prefetch_target_step == self.current_step:
+            self._schedule_more_gop_prefetch()
+        elif self.should_reuse(self.current_step):
+            self._start_gop_prefetch_for_step(self.current_step)
+        else:
+            key_ref_plan = self._build_key_ref_prefetch_plan(self.current_step)
+            next_step = self.current_step + 1
+            if next_step < self.total_step_num and self.should_reuse(next_step):
+                self._start_gop_prefetch_for_step(
+                    next_step,
+                    extra_plan=key_ref_plan,
+                )
+            elif key_ref_plan:
+                self._start_gop_prefetch_plan(
+                    key_ref_plan,
+                    preserve_until_step=self.current_step,
+                )
 
     def map_to_group_min(self, step: int) -> Optional[int]:
         """
@@ -299,6 +330,7 @@ class FluxCacheManager(BaseCacheManager):
     # ---------- 激活读写 ----------
 
     def set_compression_image_key(self, image_key: Optional[str]) -> None:
+        self._reset_gop_prefetch_state(wait=True)
         self._clear_decoded_gop_cache()
         self._compression_current_image_key = (
             None if image_key is None else str(image_key)
@@ -523,11 +555,18 @@ class FluxCacheManager(BaseCacheManager):
         status = "ok"
         error = None
         gop_decode_cache_hit = None
+        gop_prefetch_wait_s = 0.0
+        gop_decode_source = None
         try:
             if compressed_data.get("compression_mode") == "inter_layer_gop":
                 if frame_index is None:
                     raise ValueError("GOP compressed cache requires frame_index")
-                decompressed, gop_decode_cache_hit = self._get_decoded_gop_frame(
+                (
+                    decompressed,
+                    gop_decode_cache_hit,
+                    gop_prefetch_wait_s,
+                    gop_decode_source,
+                ) = self._get_decoded_gop_frame(
                     compressed_data,
                     frame_index=int(frame_index),
                     target_device=target_device,
@@ -573,6 +612,8 @@ class FluxCacheManager(BaseCacheManager):
                     "compressed_total_bytes": payload_bytes + auxiliary_bytes,
                     "decompression_time_s": float(elapsed_s),
                     "gop_decode_cache_hit": gop_decode_cache_hit,
+                    "gop_prefetch_wait_s": float(gop_prefetch_wait_s),
+                    "gop_decode_source": gop_decode_source,
                     "decoded_gop_cache_entries": len(self._decoded_gop_cache),
                     "error": error,
                 }
@@ -611,8 +652,310 @@ class FluxCacheManager(BaseCacheManager):
         return str(torch.device(target_device))
 
     def _clear_decoded_gop_cache(self) -> None:
-        self._decoded_gop_cache.clear()
-        self._decoded_gop_access_order.clear()
+        with self._gop_prefetch_lock:
+            self._decoded_gop_cache.clear()
+            self._decoded_gop_access_order.clear()
+
+    def _ensure_gop_prefetch_executor(self) -> ThreadPoolExecutor:
+        if self._gop_prefetch_executor is None:
+            self._gop_prefetch_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="cacheedit-gop-prefetch",
+            )
+        return self._gop_prefetch_executor
+
+    def _decode_gop_sequence(
+        self,
+        compressed_data: Dict[str, Any],
+        target_device: Optional[torch.device],
+    ) -> List[Tensor]:
+        if self.decompressor is None:
+            raise RuntimeError("No decompressor available for compressed cache")
+        with self._gop_decode_lock:
+            return self.decompressor.decompress_sequence(
+                compressed_data,
+                target_device=target_device,
+            )
+
+    def _install_decoded_gop_frames(
+        self,
+        cache_key: Tuple[int, str],
+        frames: List[Tensor],
+    ) -> None:
+        with self._gop_prefetch_lock:
+            if cache_key in self._decoded_gop_cache:
+                if cache_key in self._decoded_gop_access_order:
+                    self._decoded_gop_access_order.remove(cache_key)
+                self._decoded_gop_access_order.append(cache_key)
+                return
+
+            while len(self._decoded_gop_cache) >= self._decoded_gop_max_entries:
+                lru_key = self._decoded_gop_access_order.pop(0)
+                self._decoded_gop_cache.pop(lru_key, None)
+
+            self._decoded_gop_cache[cache_key] = frames
+            self._decoded_gop_access_order.append(cache_key)
+
+    def _take_decoded_gop_cache(
+        self,
+        cache_key: Tuple[int, str],
+    ) -> Optional[List[Tensor]]:
+        with self._gop_prefetch_lock:
+            frames = self._decoded_gop_cache.get(cache_key)
+            if frames is None:
+                return None
+            if cache_key in self._decoded_gop_access_order:
+                self._decoded_gop_access_order.remove(cache_key)
+            self._decoded_gop_access_order.append(cache_key)
+            return frames
+
+    def _run_gop_prefetch(
+        self,
+        compressed_data: Dict[str, Any],
+        plan_item: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        t0 = time.time()
+        try:
+            frames = self._decode_gop_sequence(
+                compressed_data,
+                target_device=None,
+            )
+            return {
+                "status": "ok",
+                "frames": frames,
+                "elapsed_s": time.time() - t0,
+                "plan_item": plan_item,
+            }
+        except Exception as exc:
+            return {
+                "status": "failed",
+                "frames": None,
+                "elapsed_s": time.time() - t0,
+                "error": str(exc),
+                "plan_item": plan_item,
+            }
+
+    def _record_gop_prefetch_result(
+        self,
+        result: Dict[str, Any],
+        *,
+        used: bool,
+    ) -> None:
+        plan_item = result.get("plan_item") or {}
+        self._gop_prefetch_records.append(
+            {
+                "status": str(result.get("status", "unknown")),
+                "used": bool(used),
+                "image_key": self._compression_current_image_key,
+                "round": int(self.current_round),
+                "request_step": int(self.current_step),
+                "target_step": plan_item.get("target_step"),
+                "cache_step": plan_item.get("cache_step"),
+                "stream": plan_item.get("stream"),
+                "layers": plan_item.get("layers"),
+                "purpose": plan_item.get("purpose", "reuse"),
+                "compression_mode": "inter_layer_gop",
+                "prefetch_time_s": float(result.get("elapsed_s", 0.0) or 0.0),
+                "error": result.get("error"),
+            }
+        )
+
+    def _schedule_gop_prefetch_locked(self) -> None:
+        if self.decompressor is None:
+            return
+        executor = self._ensure_gop_prefetch_executor()
+        while (
+            len(self._gop_prefetch_futures) < self._gop_prefetch_window
+            and self._gop_prefetch_next_index < len(self._gop_prefetch_plan)
+        ):
+            plan_item = self._gop_prefetch_plan[self._gop_prefetch_next_index]
+            self._gop_prefetch_next_index += 1
+            compressed_data = plan_item["compressed_data"]
+            cache_key = (
+                id(compressed_data),
+                self._decoded_gop_device_key(None),
+            )
+            if (
+                cache_key in self._decoded_gop_cache
+                or cache_key in self._gop_prefetch_futures
+            ):
+                continue
+            future = executor.submit(
+                self._run_gop_prefetch,
+                compressed_data,
+                plan_item,
+            )
+            self._gop_prefetch_futures[cache_key] = future
+
+    def _schedule_more_gop_prefetch(self) -> None:
+        with self._gop_prefetch_lock:
+            self._schedule_gop_prefetch_locked()
+
+    def _reset_gop_prefetch_state(self, *, wait: bool) -> None:
+        with self._gop_prefetch_lock:
+            futures = list(self._gop_prefetch_futures.items())
+            self._gop_prefetch_futures.clear()
+            self._gop_prefetch_plan = []
+            self._gop_prefetch_next_index = 0
+            self._gop_prefetch_target_step = None
+
+        for _cache_key, future in futures:
+            if not future.done():
+                future.cancel()
+            if wait and not future.cancelled():
+                try:
+                    result = future.result()
+                    self._record_gop_prefetch_result(result, used=False)
+                except Exception as exc:
+                    self._gop_prefetch_records.append(
+                        {
+                            "status": "failed",
+                            "used": False,
+                            "image_key": self._compression_current_image_key,
+                            "round": int(self.current_round),
+                            "request_step": int(self.current_step),
+                            "target_step": None,
+                            "cache_step": None,
+                            "stream": None,
+                            "layers": None,
+                            "compression_mode": "inter_layer_gop",
+                            "prefetch_time_s": 0.0,
+                            "error": str(exc),
+                        }
+                    )
+
+    def _shutdown_gop_prefetch_executor(self) -> None:
+        executor = self._gop_prefetch_executor
+        self._gop_prefetch_executor = None
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+
+    def _build_gop_prefetch_plan(self, step: int) -> List[Dict[str, Any]]:
+        if not self.should_reuse(step):
+            return []
+        step_to_load = self.map_to_group_min(step)
+        if step_to_load is None:
+            return []
+
+        plan: List[Dict[str, Any]] = []
+        seen: Set[int] = set()
+        stream_order: Tuple[StreamType, StreamType] = ("double", "single")
+        for stream in stream_order:
+            stream_items: List[Tuple[int, Dict[str, Any]]] = []
+            for (
+                cached_stream,
+                cached_step,
+                layer_idx,
+            ), cached in self.prev_cache.items():
+                if cached_stream != stream or cached_step != step_to_load:
+                    continue
+                if not (isinstance(cached, dict) and cached.get("compressed")):
+                    continue
+                compressed_data = cached.get("data")
+                if not (
+                    isinstance(compressed_data, dict)
+                    and compressed_data.get("compression_mode") == "inter_layer_gop"
+                ):
+                    continue
+                group_id = id(compressed_data)
+                if group_id in seen:
+                    continue
+                seen.add(group_id)
+                layers = cached.get("group_layers") or [int(layer_idx)]
+                layers = [int(x) for x in layers]
+                stream_items.append(
+                    (
+                        min(layers),
+                        {
+                            "compressed_data": compressed_data,
+                            "target_step": int(step),
+                            "cache_step": int(step_to_load),
+                            "stream": str(stream),
+                            "layers": layers,
+                        },
+                    )
+                )
+            stream_items.sort(key=lambda item: item[0])
+            plan.extend(item for _first_layer, item in stream_items)
+        return plan
+
+    def _build_key_ref_prefetch_plan(self, step: int) -> List[Dict[str, Any]]:
+        if (
+            self.is_round0
+            or self.cache_steps is None
+            or step not in self.cache_steps
+        ):
+            return []
+
+        # Key-token update uses single stream layer 37 by default. Prefetch the
+        # containing GOP group at step start so that late-step reference loading
+        # does not synchronously decode the whole group.
+        key = ("single", int(step), 37)
+        cached = self.prev_cache.get(key)
+        if not (isinstance(cached, dict) and cached.get("compressed")):
+            return []
+        compressed_data = cached.get("data")
+        if not (
+            isinstance(compressed_data, dict)
+            and compressed_data.get("compression_mode") == "inter_layer_gop"
+        ):
+            return []
+        layers = cached.get("group_layers") or [37]
+        return [
+            {
+                "compressed_data": compressed_data,
+                "target_step": int(step),
+                "cache_step": int(step),
+                "stream": "single",
+                "layers": [int(x) for x in layers],
+                "purpose": "key_ref",
+            }
+        ]
+
+    @staticmethod
+    def _merge_prefetch_plans(
+        *plans: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        merged: List[Dict[str, Any]] = []
+        for plan in plans:
+            for item in plan:
+                merged.append(item)
+        return merged
+
+    def _start_gop_prefetch_plan(
+        self,
+        plan: List[Dict[str, Any]],
+        *,
+        preserve_until_step: int,
+    ) -> None:
+        if not (
+            self.use_compression
+            and self.decompressor is not None
+            and self.compression_gop_length > 1
+        ):
+            return
+        if not plan:
+            return
+        with self._gop_prefetch_lock:
+            self._gop_prefetch_plan = plan
+            self._gop_prefetch_next_index = 0
+            self._gop_prefetch_target_step = int(preserve_until_step)
+            self._schedule_gop_prefetch_locked()
+
+    def _start_gop_prefetch_for_step(
+        self,
+        step: int,
+        *,
+        extra_plan: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        plan = self._merge_prefetch_plans(
+            extra_plan or [],
+            self._build_gop_prefetch_plan(step),
+        )
+        self._start_gop_prefetch_plan(
+            plan,
+            preserve_until_step=step,
+        )
 
     def _get_decoded_gop_frame(
         self,
@@ -620,7 +963,7 @@ class FluxCacheManager(BaseCacheManager):
         *,
         frame_index: int,
         target_device: Optional[torch.device],
-    ) -> Tuple[Tensor, bool]:
+    ) -> Tuple[Tensor, bool, float, Optional[str]]:
         """
         Decode a GOP group once per target device and reuse frames by index.
 
@@ -632,28 +975,68 @@ class FluxCacheManager(BaseCacheManager):
         if self.decompressor is None:
             raise RuntimeError("No decompressor available for compressed cache")
 
+        target_device_obj = (
+            torch.device(target_device) if target_device is not None else None
+        )
         cache_key = (
             id(compressed_data),
-            self._decoded_gop_device_key(target_device),
+            self._decoded_gop_device_key(target_device_obj),
         )
-        cached_frames = self._decoded_gop_cache.get(cache_key)
+        canonical_key = (
+            id(compressed_data),
+            self._decoded_gop_device_key(None),
+        )
+
+        cached_frames = self._take_decoded_gop_cache(cache_key)
         if cached_frames is not None:
-            if cache_key in self._decoded_gop_access_order:
-                self._decoded_gop_access_order.remove(cache_key)
-            self._decoded_gop_access_order.append(cache_key)
-            return cached_frames[int(frame_index)], True
+            self._schedule_more_gop_prefetch()
+            return cached_frames[int(frame_index)], True, 0.0, "decoded_cache"
 
-        frames = self.decompressor.decompress_sequence(
+        canonical_frames = self._take_decoded_gop_cache(canonical_key)
+        if canonical_frames is not None:
+            frame = canonical_frames[int(frame_index)]
+            if target_device_obj is not None and frame.device != target_device_obj:
+                frame = frame.to(target_device_obj)
+            self._schedule_more_gop_prefetch()
+            return frame, True, 0.0, "decoded_cache_original_devices"
+
+        future = None
+        future_key = None
+        with self._gop_prefetch_lock:
+            future = self._gop_prefetch_futures.get(cache_key)
+            future_key = cache_key if future is not None else None
+            if future is None:
+                future = self._gop_prefetch_futures.get(canonical_key)
+                future_key = canonical_key if future is not None else None
+
+        if future is not None and future_key is not None:
+            wait_t0 = time.time()
+            result = future.result()
+            wait_s = time.time() - wait_t0
+            with self._gop_prefetch_lock:
+                self._gop_prefetch_futures.pop(future_key, None)
+            self._record_gop_prefetch_result(result, used=True)
+            if result.get("status") == "ok" and result.get("frames") is not None:
+                frames = result["frames"]
+                self._install_decoded_gop_frames(canonical_key, frames)
+                frame = frames[int(frame_index)]
+                if target_device_obj is not None and frame.device != target_device_obj:
+                    frame = frame.to(target_device_obj)
+                self._schedule_more_gop_prefetch()
+                return frame, True, wait_s, "prefetch_future"
+
+        # Synchronous fallback decodes to each frame's original device. This keeps
+        # later layers reusable even when the prefetch window did not reach them.
+        frames = self._decode_gop_sequence(
             compressed_data,
-            target_device=target_device,
+            target_device=None,
         )
-        while len(self._decoded_gop_cache) >= self._decoded_gop_max_entries:
-            lru_key = self._decoded_gop_access_order.pop(0)
-            self._decoded_gop_cache.pop(lru_key, None)
-
-        self._decoded_gop_cache[cache_key] = frames
-        self._decoded_gop_access_order.append(cache_key)
-        return frames[int(frame_index)], False
+        self._install_decoded_gop_frames(canonical_key, frames)
+        frame = frames[int(frame_index)]
+        if target_device_obj is not None and frame.device != target_device_obj:
+            frame = frame.to(target_device_obj)
+        self._schedule_more_gop_prefetch()
+        return frame, False, 0.0, "sync_decode"
 
     def _gop_compression_enabled(self) -> bool:
         return (
@@ -1138,7 +1521,12 @@ class FluxCacheManager(BaseCacheManager):
         if not self.use_activation_cache:
             return
         self._flush_pending_compression_group()
-        self._clear_decoded_gop_cache()
+        if not (
+            self._gop_prefetch_target_step is not None
+            and self._gop_prefetch_target_step > self.current_step
+        ):
+            self._reset_gop_prefetch_state(wait=True)
+            self._clear_decoded_gop_cache()
 
         if self.is_round0:
             if self.should_cache(self.current_step):
@@ -1154,7 +1542,12 @@ class FluxCacheManager(BaseCacheManager):
     def flush_new_to_prev(self) -> None:
         """覆盖式 flush（直接替换）。"""
         self._flush_pending_compression_group()
-        self._clear_decoded_gop_cache()
+        if not (
+            self._gop_prefetch_target_step is not None
+            and self._gop_prefetch_target_step > self.current_step
+        ):
+            self._reset_gop_prefetch_state(wait=True)
+            self._clear_decoded_gop_cache()
         self.prev_cache.update(self.new_cache)
         self.new_cache = {}
 
@@ -1352,6 +1745,7 @@ class FluxCacheManager(BaseCacheManager):
     def clear_cache(self) -> None:
         """清空 prev/new cache 与 key_token_indices。"""
         self._pending_compression_group = None
+        self._reset_gop_prefetch_state(wait=True)
         self._clear_decoded_gop_cache()
         self.prev_cache.clear()
         self.new_cache.clear()
@@ -1363,6 +1757,7 @@ class FluxCacheManager(BaseCacheManager):
         多图评估时每张图结束后调用。
         """
         self._flush_pending_compression_group()
+        self._reset_gop_prefetch_state(wait=True)
         self._clear_decoded_gop_cache()
         self.prev_cache.clear()
         self.new_cache.clear()
@@ -1378,6 +1773,7 @@ class FluxCacheManager(BaseCacheManager):
         self._key_indices_version = 0
         self._pending_compression_group = None
         self._clear_decoded_gop_cache()
+        self._shutdown_gop_prefetch_executor()
         self._compression_current_image_key = None
 
         print("[FluxCacheManager] reset to initial state.")
@@ -1388,6 +1784,7 @@ class FluxCacheManager(BaseCacheManager):
         """清空压缩/解压统计记录，不影响缓存内容。"""
         self._compression_records.clear()
         self._decompression_records.clear()
+        self._gop_prefetch_records.clear()
 
     @staticmethod
     def _bytes_to_mib(num_bytes: int) -> float:
@@ -1425,6 +1822,24 @@ class FluxCacheManager(BaseCacheManager):
             1
             for r in self._decompression_records
             if r.get("gop_decode_cache_hit") is False
+        )
+        gop_prefetch_success = [
+            r for r in self._gop_prefetch_records if r.get("status") == "ok"
+        ]
+        gop_prefetch_failure = [
+            r for r in self._gop_prefetch_records if r.get("status") != "ok"
+        ]
+        gop_prefetch_time_s = float(
+            sum(
+                float(r.get("prefetch_time_s", 0.0) or 0.0)
+                for r in self._gop_prefetch_records
+            )
+        )
+        gop_prefetch_wait_s = float(
+            sum(
+                float(r.get("gop_prefetch_wait_s", 0.0) or 0.0)
+                for r in self._decompression_records
+            )
         )
 
         original_bytes = int(
@@ -1486,6 +1901,14 @@ class FluxCacheManager(BaseCacheManager):
             "decompression_failure_count": len(decompress_failure),
             "gop_decode_cache_hit_count": int(gop_decode_cache_hits),
             "gop_decode_cache_miss_count": int(gop_decode_cache_misses),
+            "gop_prefetch_count": len(self._gop_prefetch_records),
+            "gop_prefetch_success_count": len(gop_prefetch_success),
+            "gop_prefetch_failure_count": len(gop_prefetch_failure),
+            "total_gop_prefetch_time_s": gop_prefetch_time_s,
+            "avg_gop_prefetch_time_s": self._safe_ratio(
+                gop_prefetch_time_s, len(self._gop_prefetch_records)
+            ),
+            "total_gop_prefetch_wait_s": gop_prefetch_wait_s,
             "original_bytes": original_bytes,
             "compressed_payload_bytes": payload_bytes,
             "compressed_auxiliary_bytes": auxiliary_bytes,
@@ -1521,6 +1944,7 @@ class FluxCacheManager(BaseCacheManager):
         if include_records:
             report["compression_records"] = list(self._compression_records)
             report["decompression_records"] = list(self._decompression_records)
+            report["gop_prefetch_records"] = list(self._gop_prefetch_records)
         return report
 
     def get_stats(self) -> Dict[str, object]:
