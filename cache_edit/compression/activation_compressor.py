@@ -771,6 +771,134 @@ class ActivationDecompressor:
             logger.error(f"[Decompress] Failed: {e}")
             raise
 
+    def decompress_sequence(
+        self,
+        compressed_dict: Dict[str, Any],
+        target_device: Optional[torch.device] = None,
+    ) -> List[torch.Tensor]:
+        """Decode and restore every frame/layer from an inter-layer GOP cache."""
+        if not NVENC_AVAILABLE:
+            raise RuntimeError("NVENC not available")
+
+        original_shapes = compressed_dict["original_shapes"]
+        original_dtypes = compressed_dict["original_dtypes"]
+        original_devices = compressed_dict["original_devices"]
+        frame_count = int(compressed_dict["frame_count"])
+        if len(original_shapes) != frame_count:
+            raise ValueError(
+                f"original_shapes has {len(original_shapes)} entries, "
+                f"expected frame_count={frame_count}"
+            )
+
+        first_shape = original_shapes[0]
+        if len(first_shape) == 3:
+            batch, seq_len, hidden_dim = first_shape
+            height = batch * seq_len
+            width = hidden_dim
+        elif len(first_shape) == 2:
+            height, width = first_shape
+        else:
+            raise ValueError(f"Unsupported shape: {first_shape}")
+
+        padded_height = ((height + self.tile_height - 1) // self.tile_height) * self.tile_height
+        padded_width = ((width + self.tile_width - 1) // self.tile_width) * self.tile_width
+
+        decode_device = target_device
+        if decode_device is None:
+            decode_device = next(
+                (
+                    device
+                    for device in original_devices
+                    if getattr(device, "type", None) == "cuda"
+                ),
+                original_devices[0],
+            )
+        if not isinstance(decode_device, torch.device):
+            decode_device = torch.device(decode_device)
+
+        try:
+            device_ctx = (
+                torch.cuda.device(decode_device)
+                if decode_device.type == "cuda"
+                else nullcontext()
+            )
+            with device_ctx:
+                sequence_pipeline = self._get_sequence_pipeline(
+                    height,
+                    width,
+                    frame_count,
+                    decode_device,
+                    codec=compressed_dict.get("codec", "hevc"),
+                )
+                single_pipeline = self._get_pipeline(
+                    height,
+                    width,
+                    decode_device,
+                    codec=compressed_dict.get("codec", "hevc"),
+                )
+
+                data_dict = compressed_dict.copy()
+                data_dict = _move_compressed_value(data_dict, decode_device)
+
+                # This is the expensive NVDEC step. Do it once for the whole GOP.
+                decoded_dict = sequence_pipeline.steps[-1].backward(data_dict)
+                decoded_tiles = decoded_dict["data"]
+                tiles_shape = decoded_dict["tiles_shape"]
+                scale = decoded_dict["scale"]
+                offset = decoded_dict["offset"]
+
+                recovered_frames: List[torch.Tensor] = []
+                for frame_index in range(frame_count):
+                    original_shape = original_shapes[frame_index]
+                    original_dtype = original_dtypes[frame_index]
+                    frame_target_device = (
+                        target_device
+                        if target_device is not None
+                        else original_devices[frame_index]
+                    )
+                    if not isinstance(frame_target_device, torch.device):
+                        frame_target_device = torch.device(frame_target_device)
+
+                    frame_dict = decoded_dict.copy()
+                    frame_dict["data"] = decoded_tiles[frame_index].contiguous()
+                    frame_dict["tiles_shape"] = [
+                        1,
+                        tiles_shape[1],
+                        tiles_shape[2],
+                        tiles_shape[3],
+                    ]
+                    frame_dict["shape"] = torch.Size([padded_height, padded_width])
+                    frame_dict = single_pipeline.steps[-2].backward(frame_dict)
+
+                    quantized_data = frame_dict["data"][:height, :width]
+                    frame_dict["data"] = quantized_data
+
+                    row_start = frame_index * height
+                    row_end = row_start + height
+                    frame_dict["scale"] = scale[row_start:row_end]
+                    frame_dict["offset"] = offset[row_start:row_end]
+
+                    frame_dict["shape"] = torch.Size([height, width])
+                    frame_dict = single_pipeline.steps[-3].backward(frame_dict)
+                    frame_dict = single_pipeline.steps[-4].backward(frame_dict)
+                    recovered_2d = frame_dict["data"]
+
+                    if len(original_shape) == 3:
+                        recovered = recovered_2d.reshape(original_shape)
+                    else:
+                        recovered = recovered_2d
+
+                    if recovered.dtype != original_dtype:
+                        recovered = recovered.to(original_dtype)
+                    if recovered.device != frame_target_device:
+                        recovered = recovered.to(frame_target_device)
+                    recovered_frames.append(recovered)
+
+            return recovered_frames
+        except Exception as e:
+            logger.error(f"[Decompress] Failed for GOP sequence: {e}")
+            raise
+
     def decompress_sequence_frame(
         self,
         compressed_dict: Dict[str, Any],
@@ -782,92 +910,22 @@ class ActivationDecompressor:
             raise RuntimeError("NVENC not available")
 
         original_shapes = compressed_dict["original_shapes"]
-        original_dtypes = compressed_dict["original_dtypes"]
-        original_devices = compressed_dict["original_devices"]
         frame_count = int(compressed_dict["frame_count"])
         if frame_index < 0 or frame_index >= frame_count:
             raise IndexError(
                 f"frame_index={frame_index} outside GOP frame_count={frame_count}"
             )
-
-        original_shape = original_shapes[frame_index]
-        original_dtype = original_dtypes[frame_index]
-        original_device = original_devices[frame_index]
-        if target_device is None:
-            target_device = original_device
-
-        if len(original_shape) == 3:
-            batch, seq_len, hidden_dim = original_shape
-            height = batch * seq_len
-            width = hidden_dim
-        elif len(original_shape) == 2:
-            height, width = original_shape
-        else:
-            raise ValueError(f"Unsupported shape: {original_shape}")
-
-        padded_height = ((height + self.tile_height - 1) // self.tile_height) * self.tile_height
-        padded_width = ((width + self.tile_width - 1) // self.tile_width) * self.tile_width
+        if frame_index >= len(original_shapes):
+            raise IndexError(
+                f"frame_index={frame_index} outside original_shapes length "
+                f"{len(original_shapes)}"
+            )
 
         try:
-            device_ctx = (
-                torch.cuda.device(target_device)
-                if target_device.type == "cuda"
-                else nullcontext()
-            )
-            with device_ctx:
-                sequence_pipeline = self._get_sequence_pipeline(
-                    height,
-                    width,
-                    frame_count,
-                    target_device,
-                    codec=compressed_dict.get("codec", "hevc"),
-                )
-                single_pipeline = self._get_pipeline(
-                    height,
-                    width,
-                    target_device,
-                    codec=compressed_dict.get("codec", "hevc"),
-                )
-
-                data_dict = compressed_dict.copy()
-                data_dict = _move_compressed_value(data_dict, target_device)
-
-                data_dict = sequence_pipeline.steps[-1].backward(data_dict)
-                tiles_shape = data_dict["tiles_shape"]
-                data_dict["data"] = data_dict["data"][frame_index]
-                data_dict["tiles_shape"] = [
-                    1,
-                    tiles_shape[1],
-                    tiles_shape[2],
-                    tiles_shape[3],
-                ]
-
-                data_dict["shape"] = torch.Size([padded_height, padded_width])
-                data_dict = single_pipeline.steps[-2].backward(data_dict)
-
-                quantized_data = data_dict["data"][:height, :width]
-                data_dict["data"] = quantized_data
-
-                row_start = frame_index * height
-                row_end = row_start + height
-                data_dict["scale"] = data_dict["scale"][row_start:row_end]
-                data_dict["offset"] = data_dict["offset"][row_start:row_end]
-
-                data_dict["shape"] = torch.Size([height, width])
-                data_dict = single_pipeline.steps[-3].backward(data_dict)
-                data_dict = single_pipeline.steps[-4].backward(data_dict)
-                recovered_2d = data_dict["data"]
-
-            if len(original_shape) == 3:
-                recovered = recovered_2d.reshape(original_shape)
-            else:
-                recovered = recovered_2d
-
-            if recovered.dtype != original_dtype:
-                recovered = recovered.to(original_dtype)
-            if recovered.device != target_device:
-                recovered = recovered.to(target_device)
-            return recovered
+            return self.decompress_sequence(
+                compressed_dict,
+                target_device=target_device,
+            )[frame_index]
         except Exception as e:
             logger.error(f"[Decompress] Failed for GOP frame {frame_index}: {e}")
             raise

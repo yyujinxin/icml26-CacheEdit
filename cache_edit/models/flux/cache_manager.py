@@ -94,6 +94,9 @@ class FluxCacheManager(BaseCacheManager):
         self._compression_current_image_key: Optional[str] = None
         self._compression_records: List[Dict[str, Any]] = []
         self._decompression_records: List[Dict[str, Any]] = []
+        self._decoded_gop_cache: Dict[Tuple[int, str], List[Tensor]] = {}
+        self._decoded_gop_access_order: List[Tuple[int, str]] = []
+        self._decoded_gop_max_entries = 2
         if self.use_compression:
             try:
                 from cache_edit.compression.activation_compressor import (
@@ -222,6 +225,7 @@ class FluxCacheManager(BaseCacheManager):
     def on_step_start(self, step: int) -> None:
         """每 step 起始钩子；step==0 时进入新一轮。"""
         self._flush_pending_compression_group()
+        self._clear_decoded_gop_cache()
         super().on_step_start(step)
         if step == 0:
             self._rearranged_pe_cache = None
@@ -295,6 +299,7 @@ class FluxCacheManager(BaseCacheManager):
     # ---------- 激活读写 ----------
 
     def set_compression_image_key(self, image_key: Optional[str]) -> None:
+        self._clear_decoded_gop_cache()
         self._compression_current_image_key = (
             None if image_key is None else str(image_key)
         )
@@ -517,11 +522,12 @@ class FluxCacheManager(BaseCacheManager):
         t0 = time.time()
         status = "ok"
         error = None
+        gop_decode_cache_hit = None
         try:
             if compressed_data.get("compression_mode") == "inter_layer_gop":
                 if frame_index is None:
                     raise ValueError("GOP compressed cache requires frame_index")
-                decompressed = self.decompressor.decompress_sequence_frame(
+                decompressed, gop_decode_cache_hit = self._get_decoded_gop_frame(
                     compressed_data,
                     frame_index=int(frame_index),
                     target_device=target_device,
@@ -566,6 +572,8 @@ class FluxCacheManager(BaseCacheManager):
                     "compressed_auxiliary_bytes": auxiliary_bytes,
                     "compressed_total_bytes": payload_bytes + auxiliary_bytes,
                     "decompression_time_s": float(elapsed_s),
+                    "gop_decode_cache_hit": gop_decode_cache_hit,
+                    "decoded_gop_cache_entries": len(self._decoded_gop_cache),
                     "error": error,
                 }
             )
@@ -595,6 +603,57 @@ class FluxCacheManager(BaseCacheManager):
                 "packet_sizes": value.packet_sizes.to(device),
             }
         return value
+
+    @staticmethod
+    def _decoded_gop_device_key(target_device: Optional[torch.device]) -> str:
+        if target_device is None:
+            return "__original_devices__"
+        return str(torch.device(target_device))
+
+    def _clear_decoded_gop_cache(self) -> None:
+        self._decoded_gop_cache.clear()
+        self._decoded_gop_access_order.clear()
+
+    def _get_decoded_gop_frame(
+        self,
+        compressed_data: Dict[str, Any],
+        *,
+        frame_index: int,
+        target_device: Optional[torch.device],
+    ) -> Tuple[Tensor, bool]:
+        """
+        Decode a GOP group once per target device and reuse frames by index.
+
+        `decompress_sequence_frame()` decodes the whole video sequence internally.
+        Calling it once per layer repeats that expensive NVDEC work. This cache
+        stores restored tensors for the current step so consecutive layers in
+        the same GOP can reuse one decode.
+        """
+        if self.decompressor is None:
+            raise RuntimeError("No decompressor available for compressed cache")
+
+        cache_key = (
+            id(compressed_data),
+            self._decoded_gop_device_key(target_device),
+        )
+        cached_frames = self._decoded_gop_cache.get(cache_key)
+        if cached_frames is not None:
+            if cache_key in self._decoded_gop_access_order:
+                self._decoded_gop_access_order.remove(cache_key)
+            self._decoded_gop_access_order.append(cache_key)
+            return cached_frames[int(frame_index)], True
+
+        frames = self.decompressor.decompress_sequence(
+            compressed_data,
+            target_device=target_device,
+        )
+        while len(self._decoded_gop_cache) >= self._decoded_gop_max_entries:
+            lru_key = self._decoded_gop_access_order.pop(0)
+            self._decoded_gop_cache.pop(lru_key, None)
+
+        self._decoded_gop_cache[cache_key] = frames
+        self._decoded_gop_access_order.append(cache_key)
+        return frames[int(frame_index)], False
 
     def _gop_compression_enabled(self) -> bool:
         return (
@@ -1079,6 +1138,7 @@ class FluxCacheManager(BaseCacheManager):
         if not self.use_activation_cache:
             return
         self._flush_pending_compression_group()
+        self._clear_decoded_gop_cache()
 
         if self.is_round0:
             if self.should_cache(self.current_step):
@@ -1094,6 +1154,7 @@ class FluxCacheManager(BaseCacheManager):
     def flush_new_to_prev(self) -> None:
         """覆盖式 flush（直接替换）。"""
         self._flush_pending_compression_group()
+        self._clear_decoded_gop_cache()
         self.prev_cache.update(self.new_cache)
         self.new_cache = {}
 
@@ -1291,6 +1352,7 @@ class FluxCacheManager(BaseCacheManager):
     def clear_cache(self) -> None:
         """清空 prev/new cache 与 key_token_indices。"""
         self._pending_compression_group = None
+        self._clear_decoded_gop_cache()
         self.prev_cache.clear()
         self.new_cache.clear()
         self.key_token_indices = None
@@ -1301,6 +1363,7 @@ class FluxCacheManager(BaseCacheManager):
         多图评估时每张图结束后调用。
         """
         self._flush_pending_compression_group()
+        self._clear_decoded_gop_cache()
         self.prev_cache.clear()
         self.new_cache.clear()
 
@@ -1314,6 +1377,7 @@ class FluxCacheManager(BaseCacheManager):
         self._prev_mask_cache = None
         self._key_indices_version = 0
         self._pending_compression_group = None
+        self._clear_decoded_gop_cache()
         self._compression_current_image_key = None
 
         print("[FluxCacheManager] reset to initial state.")
@@ -1352,6 +1416,16 @@ class FluxCacheManager(BaseCacheManager):
         decompress_failure = [
             r for r in self._decompression_records if r.get("status") != "ok"
         ]
+        gop_decode_cache_hits = sum(
+            1
+            for r in self._decompression_records
+            if r.get("gop_decode_cache_hit") is True
+        )
+        gop_decode_cache_misses = sum(
+            1
+            for r in self._decompression_records
+            if r.get("gop_decode_cache_hit") is False
+        )
 
         original_bytes = int(
             sum(int(r.get("original_bytes", 0) or 0) for r in success_records)
@@ -1410,6 +1484,8 @@ class FluxCacheManager(BaseCacheManager):
             "decompression_count": len(self._decompression_records),
             "decompression_success_count": len(decompress_success),
             "decompression_failure_count": len(decompress_failure),
+            "gop_decode_cache_hit_count": int(gop_decode_cache_hits),
+            "gop_decode_cache_miss_count": int(gop_decode_cache_misses),
             "original_bytes": original_bytes,
             "compressed_payload_bytes": payload_bytes,
             "compressed_auxiliary_bytes": auxiliary_bytes,
