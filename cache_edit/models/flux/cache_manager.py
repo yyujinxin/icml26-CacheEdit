@@ -1,7 +1,8 @@
 """Flux activation cache manager implementation."""
 
+import time
 from bisect import bisect_right
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import torch
 from torch import Tensor
@@ -40,6 +41,11 @@ class FluxCacheManager(BaseCacheManager):
         cache_interval: int = 5,
         gpu_memory_limit_gb: Optional[float] = None,
         gpu_memory_buffer_gb: float = 1.0,
+        use_compression: bool = False,
+        compression_bitrate: float = 5.0,
+        compression_codec: str = "hevc",
+        compression_gop_length: int = 1,
+        compression_frame_interval_p: int = 1,
     ):
         """
         初始化 Flux 缓存管理器。
@@ -54,6 +60,11 @@ class FluxCacheManager(BaseCacheManager):
             cache_interval: 缓存间隔（步数）；值越小缓存越密集，显存占用越大
             gpu_memory_limit_gb: 每张 GPU 的显存上限（GB），None 时自动查询
             gpu_memory_buffer_gb: 显存预留 buffer（GB），防止 OOM
+            use_compression: 是否使用 LLM.265 NVENC 压缩
+            compression_bitrate: 压缩码率（Mbps），1-10 典型值
+            compression_codec: 视频编解码器，'hevc' 或 'h264'
+            compression_gop_length: 跨连续 layer 的 GOP 长度；<=1 表示全 I 帧
+            compression_frame_interval_p: P 帧间隔；1 表示 IPPP
         """
         super().__init__(
             use_activation_cache=use_activation_cache,
@@ -68,6 +79,46 @@ class FluxCacheManager(BaseCacheManager):
         self.gpu_memory_limit_gb = gpu_memory_limit_gb
         self.gpu_memory_buffer_gb = gpu_memory_buffer_gb
         self.stream_type: StreamType = "single"
+
+        # 压缩配置
+        self.use_compression = use_compression
+        self.compression_bitrate = compression_bitrate
+        self.compression_codec = compression_codec
+        self.compression_gop_length = int(compression_gop_length or 1)
+        self.compression_frame_interval_p = int(compression_frame_interval_p or 1)
+
+        # 初始化压缩器（仅在需要时）
+        self.compressor = None
+        self.decompressor = None
+        self._pending_compression_group: Optional[Dict[str, Any]] = None
+        self._compression_current_image_key: Optional[str] = None
+        self._compression_records: List[Dict[str, Any]] = []
+        self._decompression_records: List[Dict[str, Any]] = []
+        if self.use_compression:
+            try:
+                from cache_edit.compression.activation_compressor import (
+                    ActivationCompressor,
+                    ActivationDecompressor,
+                )
+                self.compressor = ActivationCompressor(
+                    bitrate=compression_bitrate,
+                    codec=compression_codec,
+                )
+                self.decompressor = ActivationDecompressor()
+                gop_msg = (
+                    f", GOP={self.compression_gop_length}, "
+                    f"frame_interval_p={self.compression_frame_interval_p}"
+                    if self.compression_gop_length > 1
+                    else ", all-I"
+                )
+                print(
+                    f"[FluxCacheManager] Compression enabled: "
+                    f"{compression_codec} @ {compression_bitrate}Mbps{gop_msg}"
+                )
+            except Exception as e:
+                print(f"[FluxCacheManager] Failed to initialize compression: {e}")
+                print(f"[FluxCacheManager] Falling back to uncompressed cache")
+                self.use_compression = False
 
         # 自动查询 GPU 显存上限
         if self.gpu_memory_limit_gb is None and torch.cuda.is_available():
@@ -170,6 +221,7 @@ class FluxCacheManager(BaseCacheManager):
 
     def on_step_start(self, step: int) -> None:
         """每 step 起始钩子；step==0 时进入新一轮。"""
+        self._flush_pending_compression_group()
         super().on_step_start(step)
         if step == 0:
             self._rearranged_pe_cache = None
@@ -242,6 +294,590 @@ class FluxCacheManager(BaseCacheManager):
 
     # ---------- 激活读写 ----------
 
+    def set_compression_image_key(self, image_key: Optional[str]) -> None:
+        self._compression_current_image_key = (
+            None if image_key is None else str(image_key)
+        )
+
+    @staticmethod
+    def _tensor_nbytes(tensor: Tensor) -> int:
+        return int(tensor.numel() * tensor.element_size())
+
+    @classmethod
+    def _compressed_auxiliary_bytes(cls, value) -> int:
+        """
+        Count non-bitstream tensor bytes kept beside the encoded payload.
+
+        `code_size` already tracks encoded bitstream bytes. This helper counts
+        quantization scales/offsets and NVENC packet-size metadata so the report
+        can show both payload-only and total cached sizes.
+        """
+        if isinstance(value, torch.Tensor):
+            return cls._tensor_nbytes(value)
+        if isinstance(value, dict):
+            total = 0
+            for key, item in value.items():
+                if key == "bitstream":
+                    continue
+                total += cls._compressed_auxiliary_bytes(item)
+            return total
+        if isinstance(value, list):
+            return sum(cls._compressed_auxiliary_bytes(item) for item in value)
+        if isinstance(value, tuple):
+            return sum(cls._compressed_auxiliary_bytes(item) for item in value)
+        if hasattr(value, "bitstream") and hasattr(value, "packet_sizes"):
+            return cls._tensor_nbytes(value.packet_sizes)
+        return 0
+
+    @staticmethod
+    def _safe_ratio(numerator: int, denominator: int) -> Optional[float]:
+        if denominator <= 0:
+            return None
+        return float(numerator) / float(denominator)
+
+    def _record_compression_success(
+        self,
+        *,
+        stream: StreamType,
+        layer_idx: int,
+        tensor: Tensor,
+        compressed: Dict[str, Any],
+        cache_device: torch.device,
+        elapsed_s: float,
+    ) -> None:
+        original_bytes = self._tensor_nbytes(tensor)
+        payload_bytes = int(compressed.get("code_size", 0) or 0)
+        auxiliary_bytes = self._compressed_auxiliary_bytes(compressed)
+        total_bytes = payload_bytes + auxiliary_bytes
+
+        self._compression_records.append(
+            {
+                "status": "ok",
+                "image_key": self._compression_current_image_key,
+                "round": int(self.current_round),
+                "step": int(self.current_step),
+                "layer": int(layer_idx),
+                "stream": str(stream),
+                "original_shape": [int(x) for x in tensor.shape],
+                "original_dtype": str(tensor.dtype),
+                "source_device": str(tensor.device),
+                "cache_device": str(cache_device),
+                "codec": str(self.compression_codec),
+                "bitrate_mbps": float(self.compression_bitrate),
+                "compression_mode": compressed.get(
+                    "compression_mode", "intra_layer"
+                ),
+                "original_bytes": original_bytes,
+                "compressed_payload_bytes": payload_bytes,
+                "compressed_auxiliary_bytes": auxiliary_bytes,
+                "compressed_total_bytes": total_bytes,
+                "payload_compression_ratio": self._safe_ratio(
+                    original_bytes, payload_bytes
+                ),
+                "total_compression_ratio": self._safe_ratio(
+                    original_bytes, total_bytes
+                ),
+                "compression_time_s": float(elapsed_s),
+            }
+        )
+
+    def _record_compression_group_success(
+        self,
+        *,
+        stream: StreamType,
+        layer_indices: List[int],
+        tensors: List[Tensor],
+        compressed: Dict[str, Any],
+        cache_device: torch.device,
+        elapsed_s: float,
+    ) -> None:
+        original_bytes = int(sum(self._tensor_nbytes(t) for t in tensors))
+        payload_bytes = int(compressed.get("code_size", 0) or 0)
+        auxiliary_bytes = self._compressed_auxiliary_bytes(compressed)
+        total_bytes = payload_bytes + auxiliary_bytes
+
+        self._compression_records.append(
+            {
+                "status": "ok",
+                "image_key": self._compression_current_image_key,
+                "round": int(self.current_round),
+                "step": int(self.current_step),
+                "layer": int(layer_indices[0]),
+                "layers": [int(x) for x in layer_indices],
+                "stream": str(stream),
+                "original_shape": [int(x) for x in tensors[0].shape],
+                "original_dtype": str(tensors[0].dtype),
+                "source_device": str(tensors[0].device),
+                "cache_device": str(cache_device),
+                "codec": str(self.compression_codec),
+                "bitrate_mbps": float(self.compression_bitrate),
+                "compression_mode": compressed.get(
+                    "compression_mode", "inter_layer_gop"
+                ),
+                "gop_length": compressed.get("gop_length"),
+                "frame_interval_p": compressed.get("frame_interval_p"),
+                "frame_count": len(tensors),
+                "original_bytes": original_bytes,
+                "compressed_payload_bytes": payload_bytes,
+                "compressed_auxiliary_bytes": auxiliary_bytes,
+                "compressed_total_bytes": total_bytes,
+                "payload_compression_ratio": self._safe_ratio(
+                    original_bytes, payload_bytes
+                ),
+                "total_compression_ratio": self._safe_ratio(
+                    original_bytes, total_bytes
+                ),
+                "compression_time_s": float(elapsed_s),
+            }
+        )
+
+    def _record_compression_failure(
+        self,
+        *,
+        stream: StreamType,
+        layer_idx: int,
+        tensor: Tensor,
+        cache_device: torch.device,
+        elapsed_s: float,
+        error: Exception,
+    ) -> None:
+        original_bytes = self._tensor_nbytes(tensor)
+        self._compression_records.append(
+            {
+                "status": "failed_fallback_uncompressed",
+                "image_key": self._compression_current_image_key,
+                "round": int(self.current_round),
+                "step": int(self.current_step),
+                "layer": int(layer_idx),
+                "stream": str(stream),
+                "original_shape": [int(x) for x in tensor.shape],
+                "original_dtype": str(tensor.dtype),
+                "source_device": str(tensor.device),
+                "cache_device": str(cache_device),
+                "codec": str(self.compression_codec),
+                "bitrate_mbps": float(self.compression_bitrate),
+                "original_bytes": original_bytes,
+                "stored_uncompressed_bytes": original_bytes,
+                "compression_time_s": float(elapsed_s),
+                "error": str(error),
+            }
+        )
+
+    def _record_compression_group_failure(
+        self,
+        *,
+        stream: StreamType,
+        layer_indices: List[int],
+        tensors: List[Tensor],
+        cache_device: torch.device,
+        elapsed_s: float,
+        error: Exception,
+    ) -> None:
+        original_bytes = int(sum(self._tensor_nbytes(t) for t in tensors))
+        self._compression_records.append(
+            {
+                "status": "failed_fallback_uncompressed",
+                "image_key": self._compression_current_image_key,
+                "round": int(self.current_round),
+                "step": int(self.current_step),
+                "layer": int(layer_indices[0]),
+                "layers": [int(x) for x in layer_indices],
+                "stream": str(stream),
+                "original_shape": [int(x) for x in tensors[0].shape],
+                "original_dtype": str(tensors[0].dtype),
+                "source_device": str(tensors[0].device),
+                "cache_device": str(cache_device),
+                "codec": str(self.compression_codec),
+                "bitrate_mbps": float(self.compression_bitrate),
+                "compression_mode": "inter_layer_gop",
+                "gop_length": int(self.compression_gop_length),
+                "frame_interval_p": int(self.compression_frame_interval_p),
+                "frame_count": len(tensors),
+                "original_bytes": original_bytes,
+                "stored_uncompressed_bytes": original_bytes,
+                "compression_time_s": float(elapsed_s),
+                "error": str(error),
+            }
+        )
+
+    def _decompress_cached_activation(
+        self,
+        compressed_data: Dict[str, Any],
+        *,
+        stream: StreamType,
+        layer_idx: int,
+        cache_step: Optional[int],
+        target_device: Optional[torch.device],
+        load_kind: str,
+        frame_index: Optional[int] = None,
+    ) -> Tensor:
+        if self.decompressor is None:
+            raise RuntimeError("No decompressor available for compressed cache")
+
+        t0 = time.time()
+        status = "ok"
+        error = None
+        try:
+            if compressed_data.get("compression_mode") == "inter_layer_gop":
+                if frame_index is None:
+                    raise ValueError("GOP compressed cache requires frame_index")
+                decompressed = self.decompressor.decompress_sequence_frame(
+                    compressed_data,
+                    frame_index=int(frame_index),
+                    target_device=target_device,
+                )
+            else:
+                decompressed = self.decompressor.decompress(
+                    compressed_data,
+                    target_device=target_device,
+                )
+            return decompressed
+        except Exception as exc:
+            status = "failed"
+            error = str(exc)
+            raise
+        finally:
+            elapsed_s = time.time() - t0
+            payload_bytes = int(compressed_data.get("code_size", 0) or 0)
+            auxiliary_bytes = self._compressed_auxiliary_bytes(compressed_data)
+            self._decompression_records.append(
+                {
+                    "status": status,
+                    "image_key": self._compression_current_image_key,
+                    "round": int(self.current_round),
+                    "request_step": int(self.current_step),
+                    "cache_step": (
+                        int(cache_step) if cache_step is not None else None
+                    ),
+                    "layer": int(layer_idx),
+                    "stream": str(stream),
+                    "load_kind": str(load_kind),
+                    "compression_mode": compressed_data.get(
+                        "compression_mode", "intra_layer"
+                    ),
+                    "gop_length": compressed_data.get("gop_length"),
+                    "frame_index": (
+                        int(frame_index) if frame_index is not None else None
+                    ),
+                    "target_device": (
+                        str(target_device) if target_device is not None else None
+                    ),
+                    "compressed_payload_bytes": payload_bytes,
+                    "compressed_auxiliary_bytes": auxiliary_bytes,
+                    "compressed_total_bytes": payload_bytes + auxiliary_bytes,
+                    "decompression_time_s": float(elapsed_s),
+                    "error": error,
+                }
+            )
+
+    @staticmethod
+    def _move_compressed_value(value, device: torch.device):
+        if isinstance(value, torch.Tensor):
+            return value.to(device)
+        if isinstance(value, dict):
+            return {
+                k: FluxCacheManager._move_compressed_value(v, device)
+                for k, v in value.items()
+            }
+        if isinstance(value, list):
+            return [
+                FluxCacheManager._move_compressed_value(v, device)
+                for v in value
+            ]
+        if isinstance(value, tuple):
+            return tuple(
+                FluxCacheManager._move_compressed_value(v, device)
+                for v in value
+            )
+        if hasattr(value, "bitstream") and hasattr(value, "packet_sizes"):
+            return {
+                "bitstream": value.bitstream.to(device),
+                "packet_sizes": value.packet_sizes.to(device),
+            }
+        return value
+
+    def _gop_compression_enabled(self) -> bool:
+        return (
+            self.use_compression
+            and self.compressor is not None
+            and self.compression_gop_length > 1
+        )
+
+    def _store_uncompressed_activation(
+        self,
+        key: Tuple[StreamType, int, int],
+        tensor: Tensor,
+        *,
+        smart_device: bool,
+    ) -> None:
+        if smart_device:
+            extra_bytes = tensor.numel() * tensor.element_size()
+            target_device = self._select_device(extra_bytes)
+            if target_device != self.cache_device:
+                print(
+                    f"[Cache] step={key[1]} layer={key[2]} "
+                    f"→ {target_device} (overflow from {self.cache_device})"
+                )
+            tensor = tensor.clone().detach()
+        else:
+            target_device = self.cache_device
+        self.new_cache[key] = tensor.to(target_device)
+
+    def _compress_and_store_single(
+        self,
+        stream: StreamType,
+        layer_idx: int,
+        tensor: Tensor,
+        *,
+        smart_device: bool,
+    ) -> None:
+        key = (stream, self.current_step, layer_idx)
+        t0 = time.time()
+        try:
+            compressed = self.compressor.compress(
+                tensor,
+                name=f"step{self.current_step}_layer{layer_idx}",
+            )
+            elapsed_s = time.time() - t0
+            extra_bytes = int(compressed.get("code_size", 0) or 0)
+            target_device = (
+                self._select_device(extra_bytes)
+                if smart_device
+                else self.cache_device
+            )
+
+            if smart_device and target_device != self.cache_device:
+                print(
+                    f"[Cache] step={self.current_step} layer={layer_idx} "
+                    f"→ {target_device} (overflow from {self.cache_device})"
+                )
+
+            compressed_on_device = self._move_compressed_value(
+                compressed,
+                target_device,
+            )
+            self._record_compression_success(
+                stream=stream,
+                layer_idx=layer_idx,
+                tensor=tensor,
+                compressed=compressed,
+                cache_device=target_device,
+                elapsed_s=elapsed_s,
+            )
+            self.new_cache[key] = {
+                "compressed": True,
+                "data": compressed_on_device,
+                "frame_index": None,
+            }
+        except Exception as e:
+            elapsed_s = time.time() - t0
+            fallback_device = (
+                self._select_device(tensor.numel() * tensor.element_size())
+                if smart_device
+                else self.cache_device
+            )
+            self._record_compression_failure(
+                stream=stream,
+                layer_idx=layer_idx,
+                tensor=tensor,
+                cache_device=fallback_device,
+                elapsed_s=elapsed_s,
+                error=e,
+            )
+            print(
+                f"[Cache] Compression failed for step={self.current_step} "
+                f"layer={layer_idx}: {e}"
+            )
+            self._store_uncompressed_activation(
+                key,
+                tensor,
+                smart_device=smart_device,
+            )
+
+    def _pending_group_matches(
+        self,
+        stream: StreamType,
+        layer_idx: int,
+        tensor: Tensor,
+        smart_device: bool,
+    ) -> bool:
+        pending = self._pending_compression_group
+        if pending is None:
+            return False
+        last_entry = pending["entries"][-1]
+        return (
+            pending["stream"] == stream
+            and pending["step"] == self.current_step
+            and pending["smart_device"] == smart_device
+            and tuple(pending["shape"]) == tuple(tensor.shape)
+            and pending["dtype"] == tensor.dtype
+            and int(last_entry["layer_idx"]) + 1 == int(layer_idx)
+        )
+
+    def _queue_gop_activation(
+        self,
+        stream: StreamType,
+        layer_idx: int,
+        tensor: Tensor,
+        *,
+        smart_device: bool,
+    ) -> None:
+        if not self._pending_group_matches(
+            stream,
+            layer_idx,
+            tensor,
+            smart_device,
+        ):
+            self._flush_pending_compression_group()
+            self._pending_compression_group = {
+                "stream": stream,
+                "step": self.current_step,
+                "smart_device": smart_device,
+                "shape": tuple(tensor.shape),
+                "dtype": tensor.dtype,
+                "entries": [],
+            }
+
+        self._pending_compression_group["entries"].append(
+            {
+                "layer_idx": int(layer_idx),
+                "tensor": tensor.detach(),
+            }
+        )
+        if (
+            len(self._pending_compression_group["entries"])
+            >= self.compression_gop_length
+        ):
+            self._flush_pending_compression_group()
+
+    def _flush_pending_compression_group(self) -> None:
+        pending = self._pending_compression_group
+        if not pending:
+            return
+        self._pending_compression_group = None
+
+        entries = pending["entries"]
+        if not entries:
+            return
+
+        stream = pending["stream"]
+        smart_device = bool(pending["smart_device"])
+        layer_indices = [int(entry["layer_idx"]) for entry in entries]
+        tensors = [entry["tensor"] for entry in entries]
+
+        if len(entries) == 1:
+            self._compress_and_store_single(
+                stream,
+                layer_indices[0],
+                tensors[0],
+                smart_device=smart_device,
+            )
+            return
+
+        t0 = time.time()
+        try:
+            compressed = self.compressor.compress_sequence(
+                tensors,
+                name=(
+                    f"step{self.current_step}_{stream}_layers"
+                    f"{layer_indices[0]}-{layer_indices[-1]}"
+                ),
+                gop_length=min(self.compression_gop_length, len(tensors)),
+                frame_interval_p=self.compression_frame_interval_p,
+            )
+            elapsed_s = time.time() - t0
+            extra_bytes = int(compressed.get("code_size", 0) or 0)
+            target_device = (
+                self._select_device(extra_bytes)
+                if smart_device
+                else self.cache_device
+            )
+
+            if smart_device and target_device != self.cache_device:
+                print(
+                    f"[Cache] step={self.current_step} layers="
+                    f"{layer_indices[0]}-{layer_indices[-1]} "
+                    f"→ {target_device} (overflow from {self.cache_device})"
+                )
+
+            compressed_on_device = self._move_compressed_value(
+                compressed,
+                target_device,
+            )
+            self._record_compression_group_success(
+                stream=stream,
+                layer_indices=layer_indices,
+                tensors=tensors,
+                compressed=compressed,
+                cache_device=target_device,
+                elapsed_s=elapsed_s,
+            )
+
+            for frame_index, layer_idx in enumerate(layer_indices):
+                self.new_cache[(stream, self.current_step, layer_idx)] = {
+                    "compressed": True,
+                    "data": compressed_on_device,
+                    "frame_index": int(frame_index),
+                    "group_layers": list(layer_indices),
+                }
+        except Exception as e:
+            elapsed_s = time.time() - t0
+            fallback_device = (
+                self._select_device(sum(self._tensor_nbytes(t) for t in tensors))
+                if smart_device
+                else self.cache_device
+            )
+            self._record_compression_group_failure(
+                stream=stream,
+                layer_indices=layer_indices,
+                tensors=tensors,
+                cache_device=fallback_device,
+                elapsed_s=elapsed_s,
+                error=e,
+            )
+            print(
+                f"[Cache] GOP compression failed for step={self.current_step} "
+                f"layers={layer_indices[0]}-{layer_indices[-1]}: {e}"
+            )
+            for layer_idx, tensor in zip(layer_indices, tensors):
+                self._store_uncompressed_activation(
+                    (stream, self.current_step, layer_idx),
+                    tensor,
+                    smart_device=smart_device,
+                )
+
+    def _store_activation_impl(
+        self,
+        stream: StreamType,
+        layer_idx: int,
+        tensor: Tensor,
+        *,
+        smart_device: bool,
+    ) -> None:
+        if not (self.use_activation_cache and self.should_cache(self.current_step)):
+            return
+        if self.use_compression and self.compressor is not None:
+            if self._gop_compression_enabled():
+                self._queue_gop_activation(
+                    stream,
+                    layer_idx,
+                    tensor,
+                    smart_device=smart_device,
+                )
+            else:
+                self._compress_and_store_single(
+                    stream,
+                    layer_idx,
+                    tensor,
+                    smart_device=smart_device,
+                )
+        else:
+            self._store_uncompressed_activation(
+                (stream, self.current_step, layer_idx),
+                tensor,
+                smart_device=smart_device,
+            )
+
     def store_activation(
         self,
         stream: StreamType,
@@ -251,10 +887,12 @@ class FluxCacheManager(BaseCacheManager):
         """
         简单版存储（直接用 cache_device，无多卡逻辑）。
         """
-        if not (self.use_activation_cache and self.should_cache(self.current_step)):
-            return
-        key = (stream, self.current_step, layer_idx)
-        self.new_cache[key] = tensor.to(self.cache_device)
+        self._store_activation_impl(
+            stream,
+            layer_idx,
+            tensor,
+            smart_device=False,
+        )
 
     def maby_store_activation(
         self,
@@ -265,20 +903,12 @@ class FluxCacheManager(BaseCacheManager):
         """
         多卡智能存储：从 cache_device 起始依次尝试，无空间则 fallback。
         """
-        if not (self.use_activation_cache and self.should_cache(self.current_step)):
-            return
-        key = (stream, self.current_step, layer_idx)
-        extra_bytes = tensor.numel() * tensor.element_size()
-        target_device = self._select_device(extra_bytes)
-
-        # Debug: log cross-GPU placement
-        if target_device != self.cache_device:
-            print(
-                f"[Cache] step={self.current_step} layer={layer_idx} "
-                f"→ {target_device} (overflow from {self.cache_device})"
-            )
-
-        self.new_cache[key] = tensor.to(target_device)
+        self._store_activation_impl(
+            stream,
+            layer_idx,
+            tensor,
+            smart_device=True,
+        )
 
     def get_activation(
         self,
@@ -292,7 +922,37 @@ class FluxCacheManager(BaseCacheManager):
         step = step if step is not None else self.current_step
         step_to_load = self.map_to_group_min(step)
         key = (stream, step_to_load, layer_idx)
-        return self.prev_cache.get(key, None)
+        cached = self.prev_cache.get(key, None)
+
+        if cached is None:
+            return None
+
+        # 检查是否是压缩数据
+        if isinstance(cached, dict) and cached.get('compressed', False):
+            # 解压缩
+            if self.decompressor is not None:
+                try:
+                    decompressed = self._decompress_cached_activation(
+                        cached['data'],
+                        stream=stream,
+                        layer_idx=layer_idx,
+                        cache_step=step_to_load,
+                        target_device=None,
+                        load_kind="get_activation",
+                        frame_index=cached.get("frame_index"),
+                    )
+                    # 立即清理 CUDA 缓存以防止碎片
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    return decompressed
+                except Exception as e:
+                    print(f"[Cache] Decompression failed for step={step_to_load} layer={layer_idx}: {e}")
+                    return None
+            else:
+                print(f"[Cache] No decompressor available for compressed cache")
+                return None
+        else:
+            return cached
 
     def load_activation(
         self,
@@ -310,7 +970,30 @@ class FluxCacheManager(BaseCacheManager):
         prev = self.prev_cache.get(key, None)
         if prev is None:
             return None
-        return prev.to(device)
+
+        # 检查是否是压缩数据
+        if isinstance(prev, dict) and prev.get('compressed', False):
+            # 解压缩到目标设备
+            if self.decompressor is not None:
+                try:
+                    decompressed = self._decompress_cached_activation(
+                        prev['data'],
+                        stream=stream,
+                        layer_idx=layer_idx,
+                        cache_step=step_to_load,
+                        target_device=device,
+                        load_kind="load_activation",
+                        frame_index=prev.get("frame_index"),
+                    )
+                    return decompressed
+                except Exception as e:
+                    print(f"[Cache] Decompression failed for step={step_to_load} layer={layer_idx}: {e}")
+                    return None
+            else:
+                print(f"[Cache] No decompressor available for compressed cache")
+                return None
+        else:
+            return prev.to(device)
 
     def load_key_token_ref(
         self,
@@ -327,7 +1010,30 @@ class FluxCacheManager(BaseCacheManager):
         prev = self.prev_cache.get(key, None)
         if prev is None:
             return None
-        return prev.to(device)
+
+        # 检查是否是压缩数据
+        if isinstance(prev, dict) and prev.get('compressed', False):
+            # 解压缩到目标设备
+            if self.decompressor is not None:
+                try:
+                    decompressed = self._decompress_cached_activation(
+                        prev['data'],
+                        stream=stream,
+                        layer_idx=layer_idx,
+                        cache_step=step,
+                        target_device=device,
+                        load_kind="load_key_token_ref",
+                        frame_index=prev.get("frame_index"),
+                    )
+                    return decompressed
+                except Exception as e:
+                    print(f"[Cache] Decompression failed for step={step} layer={layer_idx}: {e}")
+                    return None
+            else:
+                print(f"[Cache] No decompressor available for compressed cache")
+                return None
+        else:
+            return prev.to(device)
 
     def load_key_token_cur(
         self,
@@ -344,6 +1050,23 @@ class FluxCacheManager(BaseCacheManager):
         cur = self.new_cache.get(key, None)
         if cur is None:
             return None
+        if isinstance(cur, dict) and cur.get('compressed', False):
+            if self.decompressor is not None:
+                try:
+                    return self._decompress_cached_activation(
+                        cur['data'],
+                        stream=stream,
+                        layer_idx=layer_idx,
+                        cache_step=step,
+                        target_device=device,
+                        load_kind="load_key_token_cur",
+                        frame_index=cur.get("frame_index"),
+                    )
+                except Exception as e:
+                    print(f"[Cache] Decompression failed for step={step} layer={layer_idx}: {e}")
+                    return None
+            print(f"[Cache] No decompressor available for compressed cache")
+            return None
         return cur.to(device)
 
     def flush_new_cache_after_step(self) -> None:
@@ -355,6 +1078,7 @@ class FluxCacheManager(BaseCacheManager):
         last_step = self.total_step_num - 1
         if not self.use_activation_cache:
             return
+        self._flush_pending_compression_group()
 
         if self.is_round0:
             if self.should_cache(self.current_step):
@@ -369,6 +1093,7 @@ class FluxCacheManager(BaseCacheManager):
 
     def flush_new_to_prev(self) -> None:
         """覆盖式 flush（直接替换）。"""
+        self._flush_pending_compression_group()
         self.prev_cache.update(self.new_cache)
         self.new_cache = {}
 
@@ -444,13 +1169,14 @@ class FluxCacheManager(BaseCacheManager):
         Returns:
             (img_new, cos_img_new, sin_img_new)
         """
-        img_key = torch.index_select(img, 1, key_token_indices)
+        img_key = torch.index_select(img, 1, key_token_indices.to(img.device))
         key_token_indices_pe = key_token_indices.to(cos_img.device)
         cos_img_key = torch.index_select(cos_img, 0, key_token_indices_pe)
         sin_img_key = torch.index_select(sin_img, 0, key_token_indices_pe)
 
+        key_token_indices_img = key_token_indices.to(img.device)
         mask = torch.ones(img.size(1), dtype=torch.bool, device=img.device)
-        mask[key_token_indices] = False
+        mask[key_token_indices_img] = False
         img_not_key = img[:, mask, :]
 
         mask_pe = mask.to(cos_img.device)
@@ -564,6 +1290,7 @@ class FluxCacheManager(BaseCacheManager):
 
     def clear_cache(self) -> None:
         """清空 prev/new cache 与 key_token_indices。"""
+        self._pending_compression_group = None
         self.prev_cache.clear()
         self.new_cache.clear()
         self.key_token_indices = None
@@ -573,6 +1300,7 @@ class FluxCacheManager(BaseCacheManager):
         恢复到初始状态：清空所有缓存、重置 round/step 计数、清空 key_token_indices。
         多图评估时每张图结束后调用。
         """
+        self._flush_pending_compression_group()
         self.prev_cache.clear()
         self.new_cache.clear()
 
@@ -585,10 +1313,139 @@ class FluxCacheManager(BaseCacheManager):
         self._restore_masks = None
         self._prev_mask_cache = None
         self._key_indices_version = 0
+        self._pending_compression_group = None
+        self._compression_current_image_key = None
 
         print("[FluxCacheManager] reset to initial state.")
 
     # ---------- 统计 ----------
+
+    def reset_compression_stats(self) -> None:
+        """清空压缩/解压统计记录，不影响缓存内容。"""
+        self._compression_records.clear()
+        self._decompression_records.clear()
+
+    @staticmethod
+    def _bytes_to_mib(num_bytes: int) -> float:
+        return float(num_bytes) / 1024.0 / 1024.0
+
+    def get_compression_report(
+        self,
+        include_records: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Return JSON-serializable compression effectiveness statistics.
+
+        The report distinguishes encoded payload bytes from total cached bytes.
+        Total cached bytes include payload plus side metadata such as
+        quantization scale/offset tensors and NVENC packet-size tensors.
+        """
+        success_records = [
+            r for r in self._compression_records if r.get("status") == "ok"
+        ]
+        failure_records = [
+            r for r in self._compression_records if r.get("status") != "ok"
+        ]
+        decompress_success = [
+            r for r in self._decompression_records if r.get("status") == "ok"
+        ]
+        decompress_failure = [
+            r for r in self._decompression_records if r.get("status") != "ok"
+        ]
+
+        original_bytes = int(
+            sum(int(r.get("original_bytes", 0) or 0) for r in success_records)
+        )
+        payload_bytes = int(
+            sum(
+                int(r.get("compressed_payload_bytes", 0) or 0)
+                for r in success_records
+            )
+        )
+        auxiliary_bytes = int(
+            sum(
+                int(r.get("compressed_auxiliary_bytes", 0) or 0)
+                for r in success_records
+            )
+        )
+        total_bytes = int(
+            sum(
+                int(r.get("compressed_total_bytes", 0) or 0)
+                for r in success_records
+            )
+        )
+        uncompressed_fallback_bytes = int(
+            sum(
+                int(r.get("stored_uncompressed_bytes", 0) or 0)
+                for r in failure_records
+            )
+        )
+        compression_time_s = float(
+            sum(
+                float(r.get("compression_time_s", 0.0) or 0.0)
+                for r in self._compression_records
+            )
+        )
+        decompression_time_s = float(
+            sum(
+                float(r.get("decompression_time_s", 0.0) or 0.0)
+                for r in self._decompression_records
+            )
+        )
+        by_mode: Dict[str, int] = {}
+        for record in success_records:
+            mode = str(record.get("compression_mode", "intra_layer"))
+            by_mode[mode] = by_mode.get(mode, 0) + 1
+
+        summary = {
+            "enabled": bool(self.use_compression),
+            "codec": str(self.compression_codec),
+            "bitrate_mbps": float(self.compression_bitrate),
+            "configured_gop_length": int(self.compression_gop_length),
+            "configured_frame_interval_p": int(self.compression_frame_interval_p),
+            "success_count_by_mode": by_mode,
+            "attempt_count": len(self._compression_records),
+            "success_count": len(success_records),
+            "failure_count": len(failure_records),
+            "decompression_count": len(self._decompression_records),
+            "decompression_success_count": len(decompress_success),
+            "decompression_failure_count": len(decompress_failure),
+            "original_bytes": original_bytes,
+            "compressed_payload_bytes": payload_bytes,
+            "compressed_auxiliary_bytes": auxiliary_bytes,
+            "compressed_total_bytes": total_bytes,
+            "uncompressed_fallback_bytes": uncompressed_fallback_bytes,
+            "original_mib": self._bytes_to_mib(original_bytes),
+            "compressed_payload_mib": self._bytes_to_mib(payload_bytes),
+            "compressed_auxiliary_mib": self._bytes_to_mib(auxiliary_bytes),
+            "compressed_total_mib": self._bytes_to_mib(total_bytes),
+            "uncompressed_fallback_mib": self._bytes_to_mib(
+                uncompressed_fallback_bytes
+            ),
+            "payload_compression_ratio": self._safe_ratio(
+                original_bytes, payload_bytes
+            ),
+            "total_compression_ratio": self._safe_ratio(
+                original_bytes, total_bytes
+            ),
+            "auxiliary_over_payload_ratio": self._safe_ratio(
+                auxiliary_bytes, payload_bytes
+            ),
+            "total_compression_time_s": compression_time_s,
+            "avg_compression_time_s": self._safe_ratio(
+                compression_time_s, len(self._compression_records)
+            ),
+            "total_decompression_time_s": decompression_time_s,
+            "avg_decompression_time_s": self._safe_ratio(
+                decompression_time_s, len(self._decompression_records)
+            ),
+        }
+
+        report: Dict[str, Any] = {"summary": summary}
+        if include_records:
+            report["compression_records"] = list(self._compression_records)
+            report["decompression_records"] = list(self._decompression_records)
+        return report
 
     def get_stats(self) -> Dict[str, object]:
         stats = super().get_stats()
@@ -599,6 +1456,9 @@ class FluxCacheManager(BaseCacheManager):
                 "prev_cache_keys": len(self.prev_cache),
                 "new_cache_keys": len(self.new_cache),
                 "has_key_token_indices": self.key_token_indices is not None,
+                "compression": self.get_compression_report(
+                    include_records=False
+                ),
             }
         )
         return stats

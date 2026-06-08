@@ -56,6 +56,36 @@ logger = (
 )
 
 
+def _module_device(module) -> Optional[torch.device]:
+    """Return the device of the first tensor owned by a module."""
+    for param in module.parameters(recurse=True):
+        return param.device
+    for buffer in module.buffers(recurse=True):
+        return buffer.device
+    return None
+
+
+def _move_tensor_tree(obj, device: torch.device):
+    """Move tensors inside common container types to a device."""
+    if obj is None:
+        return None
+    if torch.is_tensor(obj):
+        return obj.to(device)
+    if isinstance(obj, tuple):
+        return tuple(_move_tensor_tree(x, device) for x in obj)
+    if isinstance(obj, list):
+        return [_move_tensor_tree(x, device) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _move_tensor_tree(v, device) for k, v in obj.items()}
+    return obj
+
+
+def _move_if_needed(tensor: Optional[torch.Tensor], device: torch.device):
+    if tensor is None or tensor.device == device:
+        return tensor
+    return tensor.to(device)
+
+
 @dataclass
 class FluxCacheVizConfig:
     """
@@ -240,6 +270,13 @@ def cache_flux_transformer_2d_forward(
                 "the PEFT backend is ineffective."
             )
 
+    embed_device = _module_device(self.x_embedder) or hidden_states.device
+    hidden_states = _move_if_needed(hidden_states, embed_device)
+    encoder_hidden_states = _move_if_needed(encoder_hidden_states, embed_device)
+    pooled_projections = _move_if_needed(pooled_projections, embed_device)
+    timestep = _move_if_needed(timestep, embed_device)
+    guidance = _move_if_needed(guidance, embed_device)
+
     hidden_states = self.x_embedder(hidden_states)
 
     timestep = timestep.to(hidden_states.dtype) * 1000
@@ -252,6 +289,10 @@ def cache_flux_transformer_2d_forward(
         else self.time_text_embed(timestep, guidance, pooled_projections)
     )
     encoder_hidden_states = self.context_embedder(encoder_hidden_states)
+
+    pos_device = _module_device(self.pos_embed) or hidden_states.device
+    txt_ids = _move_if_needed(txt_ids, pos_device)
+    img_ids = _move_if_needed(img_ids, pos_device)
 
     if txt_ids.ndim == 3:
         if logger is not None:
@@ -293,22 +334,35 @@ def cache_flux_transformer_2d_forward(
     # ---------------- double-stream blocks ----------------
     ctx.stream_type = "double"
     for index_block, block in enumerate(self.transformer_blocks):
+        block_device = _module_device(block) or hidden_states.device
+        hidden_states = _move_if_needed(hidden_states, block_device)
+        encoder_hidden_states = _move_if_needed(
+            encoder_hidden_states, block_device
+        )
+        temb = _move_if_needed(temb, block_device)
+        image_rotary_emb_for_block = _move_tensor_tree(
+            image_rotary_emb, block_device
+        )
+        joint_attention_kwargs_for_block = _move_tensor_tree(
+            joint_attention_kwargs, block_device
+        )
+
         if torch.is_grad_enabled() and getattr(self, "gradient_checkpointing", False):
             encoder_hidden_states, hidden_states = self._gradient_checkpointing_func(
                 block,
                 hidden_states,
                 encoder_hidden_states,
                 temb,
-                image_rotary_emb,
-                joint_attention_kwargs,
+                image_rotary_emb_for_block,
+                joint_attention_kwargs_for_block,
             )
         else:
             encoder_hidden_states, hidden_states = block(
                 hidden_states=hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
                 temb=temb,
-                image_rotary_emb=image_rotary_emb,
-                joint_attention_kwargs=joint_attention_kwargs,
+                image_rotary_emb=image_rotary_emb_for_block,
+                joint_attention_kwargs=joint_attention_kwargs_for_block,
             )
 
         if should_reuse:
@@ -344,33 +398,48 @@ def cache_flux_transformer_2d_forward(
                     hidden_states
                     + controlnet_block_samples[
                         index_block % len(controlnet_block_samples)
-                    ]
+                    ].to(hidden_states.device)
                 )
             else:
                 hidden_states = (
                     hidden_states
-                    + controlnet_block_samples[index_block // interval_control]
+                    + controlnet_block_samples[
+                        index_block // interval_control
+                    ].to(hidden_states.device)
                 )
 
     # ---------------- single-stream blocks ----------------
     ctx.stream_type = "single"
     for index_block, block in enumerate(self.single_transformer_blocks):
+        block_device = _module_device(block) or hidden_states.device
+        hidden_states = _move_if_needed(hidden_states, block_device)
+        encoder_hidden_states = _move_if_needed(
+            encoder_hidden_states, block_device
+        )
+        temb = _move_if_needed(temb, block_device)
+        image_rotary_emb_for_block = _move_tensor_tree(
+            image_rotary_emb, block_device
+        )
+        joint_attention_kwargs_for_block = _move_tensor_tree(
+            joint_attention_kwargs, block_device
+        )
+
         if torch.is_grad_enabled() and getattr(self, "gradient_checkpointing", False):
             encoder_hidden_states, hidden_states = self._gradient_checkpointing_func(
                 block,
                 hidden_states,
                 encoder_hidden_states,
                 temb,
-                image_rotary_emb,
-                joint_attention_kwargs,
+                image_rotary_emb_for_block,
+                joint_attention_kwargs_for_block,
             )
         else:
             encoder_hidden_states, hidden_states = block(
                 hidden_states=hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
                 temb=temb,
-                image_rotary_emb=image_rotary_emb,
-                joint_attention_kwargs=joint_attention_kwargs,
+                image_rotary_emb=image_rotary_emb_for_block,
+                joint_attention_kwargs=joint_attention_kwargs_for_block,
             )
 
         if should_reuse:
@@ -403,7 +472,9 @@ def cache_flux_transformer_2d_forward(
             interval_control = int(np.ceil(interval_control))
             hidden_states = (
                 hidden_states
-                + controlnet_single_block_samples[index_block // interval_control]
+                + controlnet_single_block_samples[
+                    index_block // interval_control
+                ].to(hidden_states.device)
             )
 
     # ---- update key_token_indices ----
@@ -422,6 +493,10 @@ def cache_flux_transformer_2d_forward(
 
     # ---- restore token order if reused ----
     hidden_states = ctx.maybe_restore_img_order(img=hidden_states)
+
+    out_device = _module_device(self.norm_out) or hidden_states.device
+    hidden_states = _move_if_needed(hidden_states, out_device)
+    temb = _move_if_needed(temb, out_device)
 
     hidden_states = self.norm_out(hidden_states, temb)
     output = self.proj_out(hidden_states)

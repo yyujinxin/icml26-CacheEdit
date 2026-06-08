@@ -215,4 +215,5 @@ def cache_flux_single_transformer_block_forward(
         hidden_states[:, :text_seq_len],
         hidden_states[:, text_seq_len:],
     )
+
     return encoder_hidden_states, hidden_states

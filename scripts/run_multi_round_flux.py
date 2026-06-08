@@ -82,12 +82,22 @@ def build_pipeline(args):
         gpu_memory_buffer_gb=args.gpu_memory_buffer_gb,
     )
 
-    pipeline = init_flux_pipeline(
-        model_path=args.model_path,
-        device=args.device,
-        dtype=torch.bfloat16,
-        cache_manager=cache_manager,
-    )
+    # 多卡时使用 device_map="balanced" 平衡分配模型到多张卡
+    if args.num_gpus > 1:
+        pipeline = init_flux_pipeline(
+            model_path=args.model_path,
+            device=args.device,
+            dtype=torch.bfloat16,
+            cache_manager=cache_manager,
+            device_map="balanced",
+        )
+    else:
+        pipeline = init_flux_pipeline(
+            model_path=args.model_path,
+            device=args.device,
+            dtype=torch.bfloat16,
+            cache_manager=cache_manager,
+        )
     pipeline.set_progress_bar_config(disable=False)
     return pipeline, cache_manager
 
@@ -108,7 +118,22 @@ def run_image(pipeline, cache_manager, row, args):
     gen_dir.mkdir(parents=True, exist_ok=True)
 
     current_image = Image.open(img_path).convert("RGB")
-    print(f"[image {key}] {len(prompts)} rounds, src={img_path}")
+
+    # 缩放图像以适应显存限制（4090 24GB）
+    max_size = 512  # 降低到512以适应多卡时激活值仍在主卡的限制
+    if max(current_image.size) > max_size:
+        w, h = current_image.size
+        if w > h:
+            new_w, new_h = max_size, int(h * max_size / w)
+        else:
+            new_w, new_h = int(w * max_size / h), max_size
+        # 调整到8的倍数（Flux要求）
+        new_w = (new_w // 8) * 8
+        new_h = (new_h // 8) * 8
+        current_image = current_image.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        print(f"[image {key}] Resized from {w}x{h} to {new_w}x{new_h}")
+
+    print(f"[image {key}] {len(prompts)} rounds, src={img_path}, size={current_image.size}")
 
     timings = []
     for r, prompt in enumerate(prompts):

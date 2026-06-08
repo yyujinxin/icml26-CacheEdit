@@ -227,7 +227,10 @@ class FluxAttnCacheProcessor:
             q_len = query.shape[1]
             cos_q = cos[:q_len, :]
             sin_q = sin[:q_len, :]
+
+            # Apply rotary embeddings
             query = apply_rotary_emb(query, (cos_q, sin_q), sequence_dim=1)
+
             key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
 
         attn_output = dispatch_attention_fn(

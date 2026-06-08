@@ -546,6 +546,11 @@ def create_default_cache_manager(
     num_gpus: int = 1,
     gpu_memory_limit_gb: Optional[float] = None,
     gpu_memory_buffer_gb: float = 1.0,
+    use_compression: bool = False,
+    compression_bitrate: float = 5.0,
+    compression_codec: str = "hevc",
+    compression_gop_length: int = 1,
+    compression_frame_interval_p: int = 1,
 ) -> FluxCacheManager:
     """
     创建一组合理默认参数的 FluxCacheManager。
@@ -558,6 +563,11 @@ def create_default_cache_manager(
         num_gpus: 可用 GPU 数量，用于多卡显存分配
         gpu_memory_limit_gb: 每张 GPU 显存上限（GB），None 时自动检测
         gpu_memory_buffer_gb: 显存预留 buffer（GB），防止 OOM
+        use_compression: 是否使用 LLM.265 NVENC 压缩
+        compression_bitrate: 压缩码率（Mbps），1-10 典型值
+        compression_codec: 视频编解码器，'hevc' 或 'h264'
+        compression_gop_length: 连续 layer 帧间压缩 GOP 长度；<=1 表示全 I 帧
+        compression_frame_interval_p: P 帧间隔；1 表示 IPPP
     """
     if cache_device is None:
         cache_device = torch.device(
@@ -573,4 +583,9 @@ def create_default_cache_manager(
         num_gpus=num_gpus,
         gpu_memory_limit_gb=gpu_memory_limit_gb,
         gpu_memory_buffer_gb=gpu_memory_buffer_gb,
+        use_compression=use_compression,
+        compression_bitrate=compression_bitrate,
+        compression_codec=compression_codec,
+        compression_gop_length=compression_gop_length,
+        compression_frame_interval_p=compression_frame_interval_p,
     )
