@@ -198,7 +198,7 @@ def _dispatch_transformer_blocks(pipeline, args):
     print(f"[Optimization] Transformer device map: {device_map}")
 
 
-def build_pipeline_with_offload(args):
+def build_pipeline_with_offload(args, *, enable_cache: bool = True):
     """Build pipeline with model parallelism across multiple GPUs."""
     from cache_edit.models.flux import create_default_cache_manager
     from cache_edit.models.flux.pipeline import CacheFluxKontextPipeline
@@ -220,10 +220,11 @@ def build_pipeline_with_offload(args):
         threshold=args.threshold,
         cache_interval=args.cache_interval,
         cache_device=torch.device("cpu"),  # Store cache on CPU to save GPU memory
+        use_activation_cache=enable_cache,
         num_gpus=args.num_gpus,
         gpu_memory_limit_gb=args.gpu_memory_limit_gb,
         gpu_memory_buffer_gb=args.gpu_memory_buffer_gb,
-        use_compression=args.use_cache_compression,
+        use_compression=enable_cache and args.use_cache_compression,
         compression_bitrate=args.compression_bitrate,
         compression_codec=args.compression_codec,
         compression_gop_length=args.compression_gop_length,
@@ -358,6 +359,8 @@ def encode_prompt_with_onload(pipeline, prompt, negative_prompt, device):
 
 def run_image(pipeline, cache_manager, memory_manager, row, args):
     prompts = extract_instructions(row)
+    if args.max_rounds is not None:
+        prompts = prompts[:args.max_rounds]
     if not prompts:
         print(f"[skip] no instruction* fields for {row.get('image_idx')}")
         return []
@@ -458,6 +461,12 @@ def get_args():
     p.add_argument("--threshold", type=float, default=0.97)
     p.add_argument("--cache-interval", type=int, default=5)
     p.add_argument("--num-inference-steps", type=int, default=110)
+    p.add_argument(
+        "--max-rounds",
+        type=int,
+        default=None,
+        help="Run only the first N edit rounds for each selected image.",
+    )
     p.add_argument("--use-cache", action="store_true", help="Enable activation cache")
     p.add_argument("--offload-encoders", action="store_true", help="Offload encoders to CPU after use")
     p.add_argument("--use-cache-compression", action="store_true",
@@ -500,19 +509,28 @@ def main():
     )
 
     if args.use_cache:
-        pipeline, cache_manager, memory_manager = build_pipeline_with_offload(args)
-    else:
-        from cache_edit.models.flux import init_flux_pipeline
-        pipeline = init_flux_pipeline(
-            model_path=args.model_path,
-            device=args.device,
-            dtype=torch.bfloat16,
-            cache_manager=None,
-            device_map="balanced" if args.num_gpus > 1 else None,
+        pipeline, cache_manager, memory_manager = build_pipeline_with_offload(
+            args,
+            enable_cache=True,
         )
-        pipeline.set_progress_bar_config(disable=False)
-        cache_manager = None
-        memory_manager = None
+    else:
+        if args.num_gpus > 1:
+            pipeline, cache_manager, memory_manager = build_pipeline_with_offload(
+                args,
+                enable_cache=False,
+            )
+        else:
+            from cache_edit.models.flux import init_flux_pipeline
+            pipeline = init_flux_pipeline(
+                model_path=args.model_path,
+                device=args.device,
+                dtype=torch.bfloat16,
+                cache_manager=None,
+                device_map=None,
+            )
+            pipeline.set_progress_bar_config(disable=False)
+            cache_manager = None
+            memory_manager = None
 
     # Offload encoders if requested
     if args.offload_encoders:
@@ -531,7 +549,11 @@ def main():
         "avg_round_time": sum(flat) / len(flat) if flat else 0.0,
         "per_image_round_times": all_timings,
     }
-    if cache_manager is not None and hasattr(cache_manager, "get_compression_report"):
+    if (
+        args.use_cache
+        and cache_manager is not None
+        and hasattr(cache_manager, "get_compression_report")
+    ):
         summary["compression"] = cache_manager.get_compression_report()
     else:
         summary["compression"] = {

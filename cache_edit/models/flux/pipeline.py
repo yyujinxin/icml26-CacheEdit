@@ -543,6 +543,7 @@ def create_default_cache_manager(
     threshold: float = 0.97,
     cache_interval: int = 5,
     cache_device: Optional[torch.device] = None,
+    use_activation_cache: bool = True,
     num_gpus: int = 1,
     gpu_memory_limit_gb: Optional[float] = None,
     gpu_memory_buffer_gb: float = 1.0,
@@ -560,6 +561,8 @@ def create_default_cache_manager(
         threshold: key-token 相似度阈值
         cache_interval: 缓存间隔（步数），值越小缓存越密集
         cache_device: 起始缓存设备，None 时自动选择
+        use_activation_cache: 是否真正存储/复用激活；False 时仅作为
+            transformer forward 的 step 上下文
         num_gpus: 可用 GPU 数量，用于多卡显存分配
         gpu_memory_limit_gb: 每张 GPU 显存上限（GB），None 时自动检测
         gpu_memory_buffer_gb: 显存预留 buffer（GB），防止 OOM
@@ -575,7 +578,7 @@ def create_default_cache_manager(
         )
 
     return FluxCacheManager(
-        use_activation_cache=True,
+        use_activation_cache=use_activation_cache,
         cache_device=cache_device,
         total_step_num=num_inference_steps,
         threshold=threshold,

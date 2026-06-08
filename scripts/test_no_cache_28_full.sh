@@ -7,6 +7,10 @@ source .venv/bin/activate
 
 # Edit parameters in this block directly.
 
+# PyTorch CUDA allocator setting. expandable_segments:True reduces
+# fragmentation; the no-cache baseline still needs activation headroom.
+PYTORCH_CUDA_ALLOC_CONF_VALUE="expandable_segments:True"
+
 # Local FLUX-Kontext model directory.
 MODEL_PATH="/mnt/data/models/black-forest-labs/FLUX___1-Kontext-dev"
 
@@ -40,6 +44,8 @@ GUIDANCE_SCALE="3.5"
 # Random seed for deterministic generation when the rest of the environment is stable.
 SEED="42"
 
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF_VALUE}"
+
 echo "=========================================="
 echo "Full 28-step baseline test"
 echo "=========================================="
@@ -52,6 +58,7 @@ echo "  - Output dir: ${OUTPUT_DIR}"
 echo "  - Inference steps: ${NUM_INFERENCE_STEPS}"
 echo "  - Guidance scale: ${GUIDANCE_SCALE}"
 echo "  - GPUs: ${NUM_GPUS}, memory limit=${GPU_MEMORY_LIMIT_GB}GB, buffer=${GPU_MEMORY_BUFFER_GB}GB"
+echo "  - CUDA allocator: ${PYTORCH_CUDA_ALLOC_CONF}"
 echo ""
 
 python scripts/run_flux_multi_gpu_optimized.py \
