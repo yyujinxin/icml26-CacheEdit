@@ -9,6 +9,7 @@ from .. import TensorDecoder
 # import matplotlib.image  # Commented out - not needed for activation compression
 import os
 import sys
+import gc
 
 
 def _encoded_tensors(encoded):
@@ -27,6 +28,8 @@ def _suppress_native_stdout():
             yield
             sys.stdout.flush()
     finally:
+        sys.stdout.flush()
+        gc.collect()
         os.dup2(saved_stdout, 1)
         os.close(saved_stdout)
 

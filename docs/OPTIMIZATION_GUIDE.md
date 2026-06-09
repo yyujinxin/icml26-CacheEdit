@@ -360,6 +360,123 @@ GOP 解码的天然代价是：即使只需要某个 layer，也通常需要解�
 
 这说明解码已经大部分被提前准备，前台等待被明显隐藏。
 
+## 优化 9：异步压缩和 overlap
+
+### 问题
+
+Nsight 结果显示，在解压已经被 prefetch 基本隐藏后，cache 压缩路径的主要瓶颈转移到了
+压缩端，尤其是：
+
+- cache step 后集中执行 GOP 压缩；
+- NVENC 相关 D2H copy；
+- CUDA stream synchronize；
+- 压缩任务阻塞 transformer 主计算流程。
+
+同步压缩时，`_flush_pending_compression_group()` 会直接调用
+`compress_sequence()`，主线程必须等当前 GOP 压缩完成才能继续后续 layer 或 step。
+
+### 方法
+
+当前实现加入了异步 GOP 压缩队列：
+
+- 主线程在 GOP 凑齐后提交 compression job；
+- cache entry 先写入 pending 状态；
+- 后台单 worker 执行 `compress_sequence()`；
+- 主线程继续执行后续 diffusion step；
+- 如果后续读取某个 pending cache entry，才等待对应 future 完成；
+- report、reset、clear cache 时会等待所有后台压缩完成，保证统计和资源清理完整。
+
+为避免 NVENC 资源竞争和显存峰值过高，当前异步队列比较保守：
+
+- `max_workers=1`
+- 最多保留 2 个 pending compression jobs
+- 超过队列上限时，主线程等待最早的 job 完成后再提交新任务
+
+### 实现位置
+
+核心逻辑在 `cache_edit/models/flux/cache_manager.py`：
+
+- `_ensure_async_compression_executor()`
+- `_run_async_compression_job()`
+- `_flush_pending_compression_group()`
+- `_resolve_pending_cache_entry()`
+- `_install_async_compression_result()`
+- `_drain_async_compression()`
+- `_wait_for_async_compression_slot()`
+
+cache entry 的 pending 结构大致为：
+
+```python
+{
+    "compressed_pending": True,
+    "future": future,
+    "job_id": job_id,
+    "frame_index": frame_index,
+    "group_layers": layer_indices,
+}
+```
+
+future 完成后，该 entry 会被替换为原有的 compressed cache entry：
+
+```python
+{
+    "compressed": True,
+    "data": compressed_on_device,
+    "frame_index": frame_index,
+    "group_layers": layer_indices,
+}
+```
+
+### 报告字段
+
+`timings.json` 的 `compression.summary` 中新增：
+
+- `async_compression_enabled`
+- `async_compression_submit_count`
+- `async_compression_completed_count`
+- `async_compression_success_count`
+- `async_compression_failure_count`
+- `async_compression_pending_count`
+- `total_async_compression_wait_s`
+- `avg_async_compression_wait_s`
+- `total_async_compression_latency_s`
+- `avg_async_compression_latency_s`
+- `total_async_compression_queue_delay_s`
+- `avg_async_compression_queue_delay_s`
+
+其中最关键的是 `total_async_compression_wait_s`。它越接近 0，说明主线程越少因为压缩
+future 阻塞。
+
+### 当前验证结果
+
+28-step、前 2 round、`cache_interval=5`、GOP 16、HEVC 5 Mbps 的验证结果：
+
+```text
+round 0: 71.90s
+round 1: 96.66s
+avg: 84.28s
+async compression jobs: 60
+async compression failures: 0
+total_async_compression_wait_s: 0.00023s
+total_compression_time_s: 81.22s
+```
+
+对比同步压缩的前 2 round：
+
+```text
+round 0: 73.84s
+round 1: 97.83s
+avg: 85.83s
+total_compression_time_s: 83.12s
+```
+
+异步压缩已经把前台等待压缩 future 的时间降到接近 0，但总耗时只小幅下降。原因是压缩
+仍然会占用 GPU/NVENC/PCIe 资源，并且为了避免 OOM，pending 队列被限制得比较保守。
+
+如果后续要继续优化，优先方向是降低后台压缩对 GPU tensor 和 D2H 带宽的占用，而不是继续
+增加 worker 数。盲目提高并发会增加显存峰值，也可能重新触发 NVENC `RegisterResource`
+资源错误。
+
 ## 当前推荐参数
 
 用于完整 28-step cache/GOP 测试：

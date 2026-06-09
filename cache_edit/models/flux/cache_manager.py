@@ -96,6 +96,16 @@ class FluxCacheManager(BaseCacheManager):
         self._compression_current_image_key: Optional[str] = None
         self._compression_records: List[Dict[str, Any]] = []
         self._decompression_records: List[Dict[str, Any]] = []
+        self._async_compression_executor: Optional[ThreadPoolExecutor] = None
+        self._async_compression_lock = threading.RLock()
+        self._async_compression_futures: Dict[int, Future] = {}
+        self._async_compression_order: List[int] = []
+        self._async_compression_installed: Set[int] = set()
+        self._async_compression_next_job_id = 0
+        self._async_compression_max_pending = 2
+        self._async_compression_wait_time_s = 0.0
+        self._async_compression_wait_count = 0
+        self._async_compression_submit_count = 0
         self._decoded_gop_cache: Dict[Tuple[int, str], List[Tensor]] = {}
         self._decoded_gop_access_order: List[Tuple[int, str]] = []
         self._decoded_gop_max_entries = 2
@@ -121,7 +131,8 @@ class FluxCacheManager(BaseCacheManager):
                 self.decompressor = ActivationDecompressor()
                 gop_msg = (
                     f", GOP={self.compression_gop_length}, "
-                    f"frame_interval_p={self.compression_frame_interval_p}"
+                    f"frame_interval_p={self.compression_frame_interval_p}, "
+                    "async"
                     if self.compression_gop_length > 1
                     else ", all-I"
                 )
@@ -236,6 +247,7 @@ class FluxCacheManager(BaseCacheManager):
     def on_step_start(self, step: int) -> None:
         """每 step 起始钩子；step==0 时进入新一轮。"""
         self._flush_pending_compression_group()
+        self._drain_async_compression(wait=False)
         keep_prefetch = self._gop_prefetch_target_step == int(step)
         if not keep_prefetch:
             self._reset_gop_prefetch_state(wait=True)
@@ -645,6 +657,337 @@ class FluxCacheManager(BaseCacheManager):
             }
         return value
 
+    def _ensure_async_compression_executor(self) -> ThreadPoolExecutor:
+        if self._async_compression_executor is None:
+            self._async_compression_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="cacheedit-gop-compress",
+            )
+        return self._async_compression_executor
+
+    def _shutdown_async_compression_executor(self) -> None:
+        executor = self._async_compression_executor
+        self._async_compression_executor = None
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+
+    def _make_async_compression_job_id(self) -> int:
+        with self._async_compression_lock:
+            job_id = self._async_compression_next_job_id
+            self._async_compression_next_job_id += 1
+            return int(job_id)
+
+    def _cache_entry_is_pending_compression(self, cached: Any) -> bool:
+        return isinstance(cached, dict) and bool(cached.get("compressed_pending"))
+
+    def _record_async_compression_group_success(
+        self,
+        *,
+        job: Dict[str, Any],
+        compressed: Dict[str, Any],
+        cache_device: torch.device,
+        elapsed_s: float,
+        queue_delay_s: float,
+        install_wait_s: float,
+    ) -> None:
+        original_bytes = int(job.get("original_bytes", 0) or 0)
+        payload_bytes = int(compressed.get("code_size", 0) or 0)
+        auxiliary_bytes = self._compressed_auxiliary_bytes(compressed)
+        total_bytes = payload_bytes + auxiliary_bytes
+        layer_indices = [int(x) for x in job["layer_indices"]]
+
+        self._compression_records.append(
+            {
+                "status": "ok",
+                "async": True,
+                "image_key": job.get("image_key"),
+                "round": int(job["round"]),
+                "step": int(job["step"]),
+                "layer": int(layer_indices[0]),
+                "layers": layer_indices,
+                "stream": str(job["stream"]),
+                "original_shape": [int(x) for x in job["original_shape"]],
+                "original_dtype": str(job["original_dtype"]),
+                "source_device": str(job["source_device"]),
+                "cache_device": str(cache_device),
+                "codec": str(self.compression_codec),
+                "bitrate_mbps": float(self.compression_bitrate),
+                "compression_mode": compressed.get(
+                    "compression_mode", "inter_layer_gop"
+                ),
+                "gop_length": compressed.get("gop_length"),
+                "frame_interval_p": compressed.get("frame_interval_p"),
+                "frame_count": int(job["frame_count"]),
+                "original_bytes": original_bytes,
+                "compressed_payload_bytes": payload_bytes,
+                "compressed_auxiliary_bytes": auxiliary_bytes,
+                "compressed_total_bytes": total_bytes,
+                "payload_compression_ratio": self._safe_ratio(
+                    original_bytes, payload_bytes
+                ),
+                "total_compression_ratio": self._safe_ratio(
+                    original_bytes, total_bytes
+                ),
+                "compression_time_s": float(elapsed_s),
+                "async_queue_delay_s": float(queue_delay_s),
+                "async_total_latency_s": float(
+                    time.time() - float(job.get("submitted_at", time.time()))
+                ),
+                "async_install_wait_s": float(install_wait_s),
+            }
+        )
+
+    def _record_async_compression_group_failure(
+        self,
+        *,
+        job: Dict[str, Any],
+        cache_device: torch.device,
+        elapsed_s: float,
+        queue_delay_s: float,
+        install_wait_s: float,
+        error: Exception,
+    ) -> None:
+        layer_indices = [int(x) for x in job["layer_indices"]]
+        original_bytes = int(job.get("original_bytes", 0) or 0)
+        self._compression_records.append(
+            {
+                "status": "failed_fallback_uncompressed",
+                "async": True,
+                "image_key": job.get("image_key"),
+                "round": int(job["round"]),
+                "step": int(job["step"]),
+                "layer": int(layer_indices[0]),
+                "layers": layer_indices,
+                "stream": str(job["stream"]),
+                "original_shape": [int(x) for x in job["original_shape"]],
+                "original_dtype": str(job["original_dtype"]),
+                "source_device": str(job["source_device"]),
+                "cache_device": str(cache_device),
+                "codec": str(self.compression_codec),
+                "bitrate_mbps": float(self.compression_bitrate),
+                "compression_mode": "inter_layer_gop",
+                "gop_length": int(self.compression_gop_length),
+                "frame_interval_p": int(self.compression_frame_interval_p),
+                "frame_count": int(job["frame_count"]),
+                "original_bytes": original_bytes,
+                "stored_uncompressed_bytes": original_bytes,
+                "compression_time_s": float(elapsed_s),
+                "async_queue_delay_s": float(queue_delay_s),
+                "async_total_latency_s": float(
+                    time.time() - float(job.get("submitted_at", time.time()))
+                ),
+                "async_install_wait_s": float(install_wait_s),
+                "error": str(error),
+            }
+        )
+
+    def _run_async_compression_job(
+        self,
+        job: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        start_s = time.time()
+        try:
+            compressed = self.compressor.compress_sequence(
+                job["tensors"],
+                name=str(job["name"]),
+                gop_length=int(job["gop_length"]),
+                frame_interval_p=int(job["frame_interval_p"]),
+            )
+            result_job = dict(job)
+            result_job["tensors"] = []
+            return {
+                "status": "ok",
+                "job": result_job,
+                "compressed": compressed,
+                "elapsed_s": time.time() - start_s,
+                "queue_delay_s": start_s - float(job["submitted_at"]),
+            }
+        except Exception as exc:
+            return {
+                "status": "failed",
+                "job": job,
+                "compressed": None,
+                "elapsed_s": time.time() - start_s,
+                "queue_delay_s": start_s - float(job["submitted_at"]),
+                "error": exc,
+            }
+
+    def _set_resolved_cache_value(
+        self,
+        key: Tuple[StreamType, int, int],
+        job_id: int,
+        value: Any,
+    ) -> None:
+        for cache in (self.new_cache, self.prev_cache):
+            current = cache.get(key)
+            if (
+                self._cache_entry_is_pending_compression(current)
+                and int(current.get("job_id", -1)) == int(job_id)
+            ):
+                cache[key] = value
+
+    def _install_async_compression_result(
+        self,
+        result: Dict[str, Any],
+        *,
+        install_wait_s: float,
+    ) -> None:
+        job = result["job"]
+        job_id = int(job["job_id"])
+        with self._async_compression_lock:
+            if job_id in self._async_compression_installed:
+                return
+            self._async_compression_installed.add(job_id)
+            self._async_compression_futures.pop(job_id, None)
+            if job_id in self._async_compression_order:
+                self._async_compression_order.remove(job_id)
+
+        stream = job["stream"]
+        step = int(job["step"])
+        layer_indices = [int(x) for x in job["layer_indices"]]
+        smart_device = bool(job["smart_device"])
+
+        if result.get("status") == "ok" and result.get("compressed") is not None:
+            compressed = result["compressed"]
+            extra_bytes = int(compressed.get("code_size", 0) or 0)
+            target_device = (
+                self._select_device(extra_bytes)
+                if smart_device
+                else self.cache_device
+            )
+            if smart_device and target_device != self.cache_device:
+                print(
+                    f"[Cache] step={step} layers="
+                    f"{layer_indices[0]}-{layer_indices[-1]} "
+                    f"→ {target_device} (overflow from {self.cache_device})"
+                )
+            compressed_on_device = self._move_compressed_value(
+                compressed,
+                target_device,
+            )
+            self._record_async_compression_group_success(
+                job=job,
+                compressed=compressed,
+                cache_device=target_device,
+                elapsed_s=float(result.get("elapsed_s", 0.0) or 0.0),
+                queue_delay_s=float(result.get("queue_delay_s", 0.0) or 0.0),
+                install_wait_s=install_wait_s,
+            )
+            for frame_index, layer_idx in enumerate(layer_indices):
+                key = (stream, step, layer_idx)
+                self._set_resolved_cache_value(
+                    key,
+                    job_id,
+                    {
+                        "compressed": True,
+                        "data": compressed_on_device,
+                        "frame_index": int(frame_index),
+                        "group_layers": list(layer_indices),
+                    },
+                )
+            return
+
+        error = result.get("error") or RuntimeError("unknown compression error")
+        tensors = job.get("tensors") or []
+        fallback_bytes = int(sum(self._tensor_nbytes(t) for t in tensors))
+        target_device = (
+            self._select_device(fallback_bytes)
+            if smart_device
+            else self.cache_device
+        )
+        self._record_async_compression_group_failure(
+            job=job,
+            cache_device=target_device,
+            elapsed_s=float(result.get("elapsed_s", 0.0) or 0.0),
+            queue_delay_s=float(result.get("queue_delay_s", 0.0) or 0.0),
+            install_wait_s=install_wait_s,
+            error=error if isinstance(error, Exception) else RuntimeError(str(error)),
+        )
+        print(
+            f"[Cache] GOP compression failed for step={step} "
+            f"layers={layer_indices[0]}-{layer_indices[-1]}: {error}"
+        )
+        for layer_idx, tensor in zip(layer_indices, tensors):
+            self._set_resolved_cache_value(
+                (stream, step, int(layer_idx)),
+                job_id,
+                tensor.to(target_device),
+            )
+
+    def _drain_async_compression(self, *, wait: bool) -> None:
+        while True:
+            with self._async_compression_lock:
+                items = [
+                    (job_id, future)
+                    for job_id, future in self._async_compression_futures.items()
+                    if wait or future.done()
+                ]
+                if not items:
+                    return
+                items.sort(
+                    key=lambda item: (
+                        self._async_compression_order.index(item[0])
+                        if item[0] in self._async_compression_order
+                        else 10**9
+                    )
+                )
+            for _job_id, future in items:
+                wait_t0 = time.time()
+                result = future.result()
+                wait_s = time.time() - wait_t0
+                if wait_s > 0:
+                    self._async_compression_wait_time_s += float(wait_s)
+                    self._async_compression_wait_count += 1
+                self._install_async_compression_result(
+                    result,
+                    install_wait_s=wait_s,
+                )
+            if not wait:
+                return
+
+    def _wait_for_async_compression_slot(self) -> None:
+        self._drain_async_compression(wait=False)
+        while True:
+            with self._async_compression_lock:
+                if (
+                    len(self._async_compression_futures)
+                    < self._async_compression_max_pending
+                ):
+                    return
+                oldest_id = self._async_compression_order[0]
+                future = self._async_compression_futures[oldest_id]
+            wait_t0 = time.time()
+            result = future.result()
+            wait_s = time.time() - wait_t0
+            self._async_compression_wait_time_s += float(wait_s)
+            self._async_compression_wait_count += 1
+            self._install_async_compression_result(
+                result,
+                install_wait_s=wait_s,
+            )
+
+    def _resolve_pending_cache_entry(
+        self,
+        cache: Dict[Any, Any],
+        key: Tuple[StreamType, int, int],
+    ) -> Any:
+        cached = cache.get(key)
+        if not self._cache_entry_is_pending_compression(cached):
+            return cached
+        future = cached.get("future")
+        if future is None:
+            return cached
+        wait_t0 = time.time()
+        result = future.result()
+        wait_s = time.time() - wait_t0
+        self._async_compression_wait_time_s += float(wait_s)
+        self._async_compression_wait_count += 1
+        self._install_async_compression_result(
+            result,
+            install_wait_s=wait_s,
+        )
+        return cache.get(key)
+
     @staticmethod
     def _decoded_gop_device_key(target_device: Optional[torch.device]) -> str:
         if target_device is None:
@@ -849,6 +1192,10 @@ class FluxCacheManager(BaseCacheManager):
             ), cached in self.prev_cache.items():
                 if cached_stream != stream or cached_step != step_to_load:
                     continue
+                cached = self._resolve_pending_cache_entry(
+                    self.prev_cache,
+                    (cached_stream, cached_step, layer_idx),
+                )
                 if not (isinstance(cached, dict) and cached.get("compressed")):
                     continue
                 compressed_data = cached.get("data")
@@ -891,7 +1238,7 @@ class FluxCacheManager(BaseCacheManager):
         # containing GOP group at step start so that late-step reference loading
         # does not synchronously decode the whole group.
         key = ("single", int(step), 37)
-        cached = self.prev_cache.get(key)
+        cached = self._resolve_pending_cache_entry(self.prev_cache, key)
         if not (isinstance(cached, dict) and cached.get("compressed")):
             return []
         compressed_data = cached.get("data")
@@ -1216,77 +1563,49 @@ class FluxCacheManager(BaseCacheManager):
             )
             return
 
-        t0 = time.time()
-        try:
-            compressed = self.compressor.compress_sequence(
-                tensors,
-                name=(
-                    f"step{self.current_step}_{stream}_layers"
-                    f"{layer_indices[0]}-{layer_indices[-1]}"
-                ),
-                gop_length=min(self.compression_gop_length, len(tensors)),
-                frame_interval_p=self.compression_frame_interval_p,
-            )
-            elapsed_s = time.time() - t0
-            extra_bytes = int(compressed.get("code_size", 0) or 0)
-            target_device = (
-                self._select_device(extra_bytes)
-                if smart_device
-                else self.cache_device
-            )
+        self._wait_for_async_compression_slot()
+        job_id = self._make_async_compression_job_id()
+        step = int(pending["step"])
+        job = {
+            "job_id": job_id,
+            "image_key": self._compression_current_image_key,
+            "round": int(self.current_round),
+            "step": step,
+            "stream": stream,
+            "smart_device": smart_device,
+            "layer_indices": list(layer_indices),
+            "tensors": tensors,
+            "original_shape": tuple(tensors[0].shape),
+            "original_dtype": str(tensors[0].dtype),
+            "source_device": str(tensors[0].device),
+            "original_bytes": int(sum(self._tensor_nbytes(t) for t in tensors)),
+            "frame_count": len(tensors),
+            "gop_length": min(self.compression_gop_length, len(tensors)),
+            "frame_interval_p": self.compression_frame_interval_p,
+            "name": (
+                f"step{step}_{stream}_layers"
+                f"{layer_indices[0]}-{layer_indices[-1]}"
+            ),
+            "submitted_at": time.time(),
+        }
+        executor = self._ensure_async_compression_executor()
+        future = executor.submit(self._run_async_compression_job, job)
+        with self._async_compression_lock:
+            self._async_compression_futures[job_id] = future
+            self._async_compression_order.append(job_id)
+            self._async_compression_submit_count += 1
 
-            if smart_device and target_device != self.cache_device:
-                print(
-                    f"[Cache] step={self.current_step} layers="
-                    f"{layer_indices[0]}-{layer_indices[-1]} "
-                    f"→ {target_device} (overflow from {self.cache_device})"
-                )
-
-            compressed_on_device = self._move_compressed_value(
-                compressed,
-                target_device,
-            )
-            self._record_compression_group_success(
-                stream=stream,
-                layer_indices=layer_indices,
-                tensors=tensors,
-                compressed=compressed,
-                cache_device=target_device,
-                elapsed_s=elapsed_s,
-            )
-
-            for frame_index, layer_idx in enumerate(layer_indices):
-                self.new_cache[(stream, self.current_step, layer_idx)] = {
-                    "compressed": True,
-                    "data": compressed_on_device,
-                    "frame_index": int(frame_index),
-                    "group_layers": list(layer_indices),
-                }
-        except Exception as e:
-            elapsed_s = time.time() - t0
-            fallback_device = (
-                self._select_device(sum(self._tensor_nbytes(t) for t in tensors))
-                if smart_device
-                else self.cache_device
-            )
-            self._record_compression_group_failure(
-                stream=stream,
-                layer_indices=layer_indices,
-                tensors=tensors,
-                cache_device=fallback_device,
-                elapsed_s=elapsed_s,
-                error=e,
-            )
-            print(
-                f"[Cache] GOP compression failed for step={self.current_step} "
-                f"layers={layer_indices[0]}-{layer_indices[-1]}: {e}"
-            )
-            for layer_idx, tensor in zip(layer_indices, tensors):
-                self._store_uncompressed_activation(
-                    (stream, self.current_step, layer_idx),
-                    tensor,
-                    smart_device=smart_device,
-                )
+        for frame_index, layer_idx in enumerate(layer_indices):
+            self.new_cache[(stream, step, layer_idx)] = {
+                "compressed_pending": True,
+                "future": future,
+                "job_id": int(job_id),
+                "frame_index": int(frame_index),
+                "group_layers": list(layer_indices),
+                "stream": str(stream),
+                "step": int(step),
+                "layer": int(layer_idx),
+            }
 
     def _store_activation_impl(
         self,
@@ -1364,7 +1683,7 @@ class FluxCacheManager(BaseCacheManager):
         step = step if step is not None else self.current_step
         step_to_load = self.map_to_group_min(step)
         key = (stream, step_to_load, layer_idx)
-        cached = self.prev_cache.get(key, None)
+        cached = self._resolve_pending_cache_entry(self.prev_cache, key)
 
         if cached is None:
             return None
@@ -1409,7 +1728,7 @@ class FluxCacheManager(BaseCacheManager):
         step = step if step is not None else self.current_step
         step_to_load = self.map_to_group_min(step)
         key = (stream, step_to_load, layer_idx)
-        prev = self.prev_cache.get(key, None)
+        prev = self._resolve_pending_cache_entry(self.prev_cache, key)
         if prev is None:
             return None
 
@@ -1449,7 +1768,7 @@ class FluxCacheManager(BaseCacheManager):
             return None
         step = step if step is not None else self.current_step
         key = (stream, step, layer_idx)
-        prev = self.prev_cache.get(key, None)
+        prev = self._resolve_pending_cache_entry(self.prev_cache, key)
         if prev is None:
             return None
 
@@ -1489,7 +1808,7 @@ class FluxCacheManager(BaseCacheManager):
             return None
         step = step if step is not None else self.current_step
         key = (stream, step, layer_idx)
-        cur = self.new_cache.get(key, None)
+        cur = self._resolve_pending_cache_entry(self.new_cache, key)
         if cur is None:
             return None
         if isinstance(cur, dict) and cur.get('compressed', False):
@@ -1521,6 +1840,7 @@ class FluxCacheManager(BaseCacheManager):
         if not self.use_activation_cache:
             return
         self._flush_pending_compression_group()
+        self._drain_async_compression(wait=False)
         if not (
             self._gop_prefetch_target_step is not None
             and self._gop_prefetch_target_step > self.current_step
@@ -1542,6 +1862,7 @@ class FluxCacheManager(BaseCacheManager):
     def flush_new_to_prev(self) -> None:
         """覆盖式 flush（直接替换）。"""
         self._flush_pending_compression_group()
+        self._drain_async_compression(wait=False)
         if not (
             self._gop_prefetch_target_step is not None
             and self._gop_prefetch_target_step > self.current_step
@@ -1744,7 +2065,8 @@ class FluxCacheManager(BaseCacheManager):
 
     def clear_cache(self) -> None:
         """清空 prev/new cache 与 key_token_indices。"""
-        self._pending_compression_group = None
+        self._flush_pending_compression_group()
+        self._drain_async_compression(wait=True)
         self._reset_gop_prefetch_state(wait=True)
         self._clear_decoded_gop_cache()
         self.prev_cache.clear()
@@ -1757,6 +2079,7 @@ class FluxCacheManager(BaseCacheManager):
         多图评估时每张图结束后调用。
         """
         self._flush_pending_compression_group()
+        self._drain_async_compression(wait=True)
         self._reset_gop_prefetch_state(wait=True)
         self._clear_decoded_gop_cache()
         self.prev_cache.clear()
@@ -1772,7 +2095,11 @@ class FluxCacheManager(BaseCacheManager):
         self._prev_mask_cache = None
         self._key_indices_version = 0
         self._pending_compression_group = None
+        self._async_compression_futures.clear()
+        self._async_compression_order.clear()
+        self._async_compression_installed.clear()
         self._clear_decoded_gop_cache()
+        self._shutdown_async_compression_executor()
         self._shutdown_gop_prefetch_executor()
         self._compression_current_image_key = None
 
@@ -1782,9 +2109,13 @@ class FluxCacheManager(BaseCacheManager):
 
     def reset_compression_stats(self) -> None:
         """清空压缩/解压统计记录，不影响缓存内容。"""
+        self._drain_async_compression(wait=True)
         self._compression_records.clear()
         self._decompression_records.clear()
         self._gop_prefetch_records.clear()
+        self._async_compression_wait_time_s = 0.0
+        self._async_compression_wait_count = 0
+        self._async_compression_submit_count = 0
 
     @staticmethod
     def _bytes_to_mib(num_bytes: int) -> float:
@@ -1801,6 +2132,8 @@ class FluxCacheManager(BaseCacheManager):
         Total cached bytes include payload plus side metadata such as
         quantization scale/offset tensors and NVENC packet-size tensors.
         """
+        self._flush_pending_compression_group()
+        self._drain_async_compression(wait=True)
         success_records = [
             r for r in self._compression_records if r.get("status") == "ok"
         ]
@@ -1885,6 +2218,24 @@ class FluxCacheManager(BaseCacheManager):
         for record in success_records:
             mode = str(record.get("compression_mode", "intra_layer"))
             by_mode[mode] = by_mode.get(mode, 0) + 1
+        async_success_records = [
+            r for r in success_records if bool(r.get("async"))
+        ]
+        async_failure_records = [
+            r for r in failure_records if bool(r.get("async"))
+        ]
+        async_compression_latency_s = float(
+            sum(
+                float(r.get("async_total_latency_s", 0.0) or 0.0)
+                for r in async_success_records
+            )
+        )
+        async_compression_queue_delay_s = float(
+            sum(
+                float(r.get("async_queue_delay_s", 0.0) or 0.0)
+                for r in async_success_records
+            )
+        )
 
         summary = {
             "enabled": bool(self.use_compression),
@@ -1896,6 +2247,38 @@ class FluxCacheManager(BaseCacheManager):
             "attempt_count": len(self._compression_records),
             "success_count": len(success_records),
             "failure_count": len(failure_records),
+            "async_compression_enabled": bool(
+                self.use_compression and self.compression_gop_length > 1
+            ),
+            "async_compression_submit_count": int(
+                self._async_compression_submit_count
+            ),
+            "async_compression_completed_count": (
+                len(async_success_records) + len(async_failure_records)
+            ),
+            "async_compression_success_count": len(async_success_records),
+            "async_compression_failure_count": len(async_failure_records),
+            "async_compression_pending_count": len(
+                self._async_compression_futures
+            ),
+            "async_compression_wait_count": int(
+                self._async_compression_wait_count
+            ),
+            "total_async_compression_wait_s": float(
+                self._async_compression_wait_time_s
+            ),
+            "avg_async_compression_wait_s": self._safe_ratio(
+                self._async_compression_wait_time_s,
+                self._async_compression_wait_count,
+            ),
+            "total_async_compression_latency_s": async_compression_latency_s,
+            "avg_async_compression_latency_s": self._safe_ratio(
+                async_compression_latency_s, len(async_success_records)
+            ),
+            "total_async_compression_queue_delay_s": async_compression_queue_delay_s,
+            "avg_async_compression_queue_delay_s": self._safe_ratio(
+                async_compression_queue_delay_s, len(async_success_records)
+            ),
             "decompression_count": len(self._decompression_records),
             "decompression_success_count": len(decompress_success),
             "decompression_failure_count": len(decompress_failure),
