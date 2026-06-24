@@ -6,6 +6,10 @@
 目标是：在不手动限制输入图像尺寸的前提下，降低多轮编辑中的显存占用，
 提高缓存激活值压缩率，并尽量隐藏压缩、解压和数据加载带来的延迟。
 
+> 当前稳定版本说明：为了保证完整数据集稳定完成，GOP 压缩和 GOP 解码当前按同步路径执行。
+> 代码中保留了 async compression 和 GOP prefetch 的实验性结构及统计字段，但默认关闭。
+> 当前推荐 codec 是 `lossless`，即 HEVC/NVENC lossless 编码量化后的 activation 帧。
+
 ## 约束和基线
 
 ### 固定约束
@@ -179,7 +183,7 @@ outputs/flux_28step_no_cache/timings.json
 ```bash
 COMPRESSION_GOP_LENGTH="16"
 COMPRESSION_FRAME_INTERVAL_P="16"
-COMPRESSION_CODEC="hevc"
+COMPRESSION_CODEC="lossless"
 COMPRESSION_BITRATE="5.0"
 ```
 
@@ -187,8 +191,9 @@ COMPRESSION_BITRATE="5.0"
 
 - `COMPRESSION_GOP_LENGTH`：一个 GOP 中最多包含多少个连续 layer。
 - `COMPRESSION_FRAME_INTERVAL_P`：P frame 间隔参数，控制编码器如何放置预测帧。
-- `COMPRESSION_CODEC`：当前推荐 `hevc`。
-- `COMPRESSION_BITRATE`：码率越高，误差越小，但压缩率越低。
+- `COMPRESSION_CODEC`：当前推荐 `lossless`。它仍走 HEVC/NVENC codec，只是 codec
+  对量化后的帧使用 lossless 编码。
+- `COMPRESSION_BITRATE`：仅 `hevc` / `h264` 有损模式使用；`lossless` 模式忽略该值。
 
 ### 为什么当前使用 GOP 16
 
@@ -196,7 +201,11 @@ COMPRESSION_BITRATE="5.0"
 
 - GOP 太短：稳定，但层间压缩收益不足；
 - GOP 太长：压缩率可能更高，但重建误差和解码代价上升；
-- GOP 16 在当前 28-step、cache_interval=5、HEVC 5 Mbps 设置下，压缩率和稳定性更均衡。
+- GOP 16 在当前 28-step、cache_interval=5、lossless codec 设置下，压缩率和稳定性更均衡。
+
+注意：P-frame GOP 依赖 native decoder 正确处理一次 `Decode()` 返回多帧的情况。当前已修复
+decoder 输出 offset 递增问题；修复后小规模 `lossless + GOP16/P=16` 往返测试中，最大误差约为
+`0.015625`，平均绝对误差约为 `0.0046`，主要来自 FP16 到 uint8 的量化。
 
 该选择不是理论最优，只是当前硬件和样例任务上的经验配置。若换模型、数据或码率，
 仍建议重新用同一 baseline 对比。
@@ -306,7 +315,10 @@ GOP 解码的天然代价是：即使只需要某个 layer，也通常需要解�
 短测中，GOP 解码总耗时从约 `52.21s` 降到约 `10.17s`，平均解压耗时从约
 `0.227s` 降到约 `0.044s`。
 
-## 优化 8：提前解压和 overlap
+## 优化 8：提前解压和 overlap（实验性，当前默认关闭）
+
+当前稳定版本将 `_gop_prefetch_window` 设为 `0`。下面记录的是已经实现过的实验性机制，
+用于说明后续若重新打开 overlap 时需要关注哪些路径和指标。
 
 ### 问题
 
@@ -326,7 +338,7 @@ GOP 解码的天然代价是：即使只需要某个 layer，也通常需要解�
 
 ### 调度策略
 
-当前策略：
+实验性策略：
 
 - prefetch window 为 2；
 - 使用单 worker 后台线程，避免并发 NVDEC/NVENC 资源压力过大；
@@ -358,9 +370,13 @@ GOP 解码的天然代价是：即使只需要某个 layer，也通常需要解�
 - `sync_decode` 基本被消除
 - round 平均时间进一步从约 `25.29s` 降到约 `23.83s`
 
-这说明解码已经大部分被提前准备，前台等待被明显隐藏。
+这说明解码可以被提前准备、减少前台等待。但后续测试中发现 Python worker 线程内并发
+NVDEC 与 transformer CUDA kernel overlap 可能引入 CUDA context 稳定性问题，所以当前默认关闭。
 
-## 优化 9：异步压缩和 overlap
+## 优化 9：异步压缩和 overlap（实验性，当前默认关闭）
+
+当前稳定版本将 `_async_compression_max_pending` 设为 `0`。下面记录的是实验性异步压缩
+实现和当时的 Nsight 结论，代码结构保留，默认不启用。
 
 ### 问题
 
@@ -377,7 +393,7 @@ Nsight 结果显示，在解压已经被 prefetch 基本隐藏后，cache 压缩
 
 ### 方法
 
-当前实现加入了异步 GOP 压缩队列：
+实验性实现加入了异步 GOP 压缩队列：
 
 - 主线程在 GOP 凑齐后提交 compression job；
 - cache entry 先写入 pending 状态；
@@ -386,7 +402,7 @@ Nsight 结果显示，在解压已经被 prefetch 基本隐藏后，cache 压缩
 - 如果后续读取某个 pending cache entry，才等待对应 future 完成；
 - report、reset、clear cache 时会等待所有后台压缩完成，保证统计和资源清理完整。
 
-为避免 NVENC 资源竞争和显存峰值过高，当前异步队列比较保守：
+为避免 NVENC 资源竞争和显存峰值过高，实验性异步队列比较保守：
 
 - `max_workers=1`
 - 最多保留 2 个 pending compression jobs
@@ -470,12 +486,12 @@ avg: 85.83s
 total_compression_time_s: 83.12s
 ```
 
-异步压缩已经把前台等待压缩 future 的时间降到接近 0，但总耗时只小幅下降。原因是压缩
-仍然会占用 GPU/NVENC/PCIe 资源，并且为了避免 OOM，pending 队列被限制得比较保守。
+异步压缩可以把前台等待压缩 future 的时间降到接近 0，但总耗时只小幅下降。原因是压缩
+仍然会占用 GPU/NVENC/PCIe 资源，并且为了避免 OOM，pending 队列必须比较保守。
 
-如果后续要继续优化，优先方向是降低后台压缩对 GPU tensor 和 D2H 带宽的占用，而不是继续
-增加 worker 数。盲目提高并发会增加显存峰值，也可能重新触发 NVENC `RegisterResource`
-资源错误。
+如果后续要重新启用 overlap，优先方向是降低后台压缩对 GPU tensor 和 D2H 带宽的占用，
+并验证 CUDA context 稳定性；盲目提高并发会增加显存峰值，也可能重新触发 NVENC
+`RegisterResource` 资源错误。
 
 ## 当前推荐参数
 
@@ -486,7 +502,7 @@ CACHE_INTERVAL="5"
 NUM_INFERENCE_STEPS="28"
 GUIDANCE_SCALE="3.5"
 THRESHOLD="0.97"
-COMPRESSION_CODEC="hevc"
+COMPRESSION_CODEC="lossless"
 COMPRESSION_BITRATE="5.0"
 COMPRESSION_GOP_LENGTH="16"
 COMPRESSION_FRAME_INTERVAL_P="16"

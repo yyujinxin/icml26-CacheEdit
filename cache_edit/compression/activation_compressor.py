@@ -1,12 +1,17 @@
 """
 Activation compression using LLM.265 NVENC hardware acceleration.
 
-Compresses Flux activation tensors using HEVC/H.264 codecs to reduce memory footprint.
+Compresses Flux activation tensors with NVENC/NVDEC codecs to reduce cache memory.
+
+`hevc` and `h264` use lossy video rate control. `lossless` still uses the
+HEVC/NVENC codec, but switches the codec to lossless mode after the activation
+has been quantized into uint8 frames.
 """
 
 import torch
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional
 import logging
+import gc
 from contextlib import nullcontext
 
 logger = logging.getLogger(__name__)
@@ -41,11 +46,12 @@ def _move_compressed_value(value, device: torch.device):
 try:
     from .ops import (
         CodecType, RateControlMode, PresetType, TuningInfo, InputFormat,
-        TensorEncodeConfig, TensorEncoder, TensorDecoder
+        TensorEncodeConfig, TensorEncoder, TensorDecoder, EncodeQp
     )
     from .pipeline import (
         Pipeline,
         CWQuantization,
+        GWQuantization,
         FixedTiling,
         MonoNVEncode,
         MonoNVEncodeSequence,
@@ -58,9 +64,36 @@ except ImportError as e:
     # Define dummy classes for type hints
     Pipeline = object
     CWQuantization = object
+    GWQuantization = object
     FixedTiling = object
     MonoNVEncode = object
     MonoNVEncodeSequence = object
+
+
+LOSSLESS_QUANT_GROUP_SIZE = 64
+
+
+def _make_quantization_step(codec: str, width: int):
+    """Choose the quantizer paired with the codec path."""
+    if str(codec).lower() == "lossless" and width % LOSSLESS_QUANT_GROUP_SIZE == 0:
+        return GWQuantization(groupsize=LOSSLESS_QUANT_GROUP_SIZE)
+    return CWQuantization()
+
+
+def _quantization_name(codec: str, width: int) -> str:
+    if str(codec).lower() == "lossless" and width % LOSSLESS_QUANT_GROUP_SIZE == 0:
+        return f"gw{LOSSLESS_QUANT_GROUP_SIZE}"
+    return "cw"
+
+
+def _quantization_rows_per_frame(
+    quantization: Optional[str],
+    height: int,
+    width: int,
+) -> int:
+    if str(quantization or "").startswith("gw"):
+        return int(height * width // LOSSLESS_QUANT_GROUP_SIZE)
+    return int(height)
 
 
 class ActivationCompressor:
@@ -82,12 +115,14 @@ class ActivationCompressor:
         """
         Args:
             bitrate: Average bitrate in Mbps (1-10 typical)
-            codec: 'hevc' or 'h264'
+            codec: 'lossless', 'hevc', or 'h264'. lossless means HEVC/NVENC
+                lossless coding of the quantized frames, not raw tensor storage.
             tile_height: Height of video tiles
             tile_width: Width of video tiles
             bitrate_max_multiplier: Max bitrate as multiple of average
             max_cached_pipelines: Maximum number of pipelines to cache (to limit NVENC resources)
         """
+        codec = str(codec).lower()
         if not NVENC_AVAILABLE:
             raise RuntimeError("NVENC not available - cannot create ActivationCompressor")
 
@@ -106,6 +141,16 @@ class ActivationCompressor:
 
         logger.info(f"[ActivationCompressor] Initialized: bitrate={bitrate}Mbps, codec={codec}, max_pipelines={max_cached_pipelines} per GPU")
 
+    def clear_pipeline_cache(self) -> None:
+        """Drop cached pipeline objects so native NVENC resources can be freed."""
+        self._pipeline_cache_per_gpu.clear()
+        self._pipeline_access_order_per_gpu.clear()
+        self._sequence_pipeline_cache_per_gpu.clear()
+        self._sequence_pipeline_access_order_per_gpu.clear()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     def _create_config(
         self,
         gop_length: Optional[int] = None,
@@ -113,12 +158,22 @@ class ActivationCompressor:
     ) -> TensorEncodeConfig:
         config = TensorEncodeConfig()
         config.input_format = InputFormat.NV12
-        config.average_bit_rate = int(self.bitrate * 1000000)
-        config.max_bit_rate = int(self.bitrate * 1000000 * self.bitrate_max_multiplier)
-        config.codec_type = CodecType.HEVC if self.codec == "hevc" else CodecType.H264
-        config.rc_mode = RateControlMode.VBR
-        config.preset = PresetType.P7
-        config.tuning_info = TuningInfo.HighQuality
+        config.codec_type = CodecType.H264 if self.codec == "h264" else CodecType.HEVC
+        if self.codec == "lossless":
+            qp = EncodeQp()
+            qp.qpInterP = 0
+            qp.qpInterB = 0
+            qp.qpIntra = 0
+            config.rc_mode = RateControlMode.ConstQP
+            config.const_qp = qp
+            config.preset = PresetType.P1
+            config.tuning_info = TuningInfo.Lossless
+        else:
+            config.average_bit_rate = int(self.bitrate * 1000000)
+            config.max_bit_rate = int(self.bitrate * 1000000 * self.bitrate_max_multiplier)
+            config.rc_mode = RateControlMode.VBR
+            config.preset = PresetType.P7
+            config.tuning_info = TuningInfo.HighQuality
         config.monochrome = True
 
         if gop_length is not None and gop_length > 1:
@@ -151,7 +206,7 @@ class ActivationCompressor:
 
         pipeline = Pipeline([
             AddShape(),  # Add shape key for FixedTiling
-            CWQuantization(),  # FP16 -> uint8 quantization
+            _make_quantization_step(self.codec, width),  # FP16 -> uint8 quantization
             FixedTiling(
                 pad_to_shape=[padded_height, padded_width],
                 resize_to_shape=[1, 1, padded_height, padded_width],
@@ -193,7 +248,7 @@ class ActivationCompressor:
 
         return Pipeline([
             AddShape(),
-            CWQuantization(),
+            _make_quantization_step(self.codec, width),
             FixedTiling(
                 pad_to_shape=[frame_count, padded_height, padded_width],
                 resize_to_shape=[frame_count, 1, padded_height, padded_width],
@@ -358,6 +413,7 @@ class ActivationCompressor:
             compressed_dict['original_device'] = original_device
             compressed_dict['compression_mode'] = 'intra_layer'
             compressed_dict['codec'] = self.codec
+            compressed_dict['quantization'] = _quantization_name(self.codec, width)
 
             logger.debug(
                 f"[Compress] {name}: {original_shape} -> {compressed_dict['code_size']/1024/1024:.2f}MB "
@@ -377,6 +433,7 @@ class ActivationCompressor:
         gop_length: Optional[int] = None,
         frame_interval_p: Optional[int] = 1,
         target_device: Optional[torch.device] = None,
+        original_devices_override: Optional[List[torch.device]] = None,
     ) -> Dict[str, Any]:
         """
         Compress consecutive layer activations as inter-frame video frames.
@@ -388,7 +445,11 @@ class ActivationCompressor:
 
         original_shapes = [a.shape for a in activations]
         original_dtypes = [a.dtype for a in activations]
-        original_devices = [a.device for a in activations]
+        original_devices = (
+            list(original_devices_override)
+            if original_devices_override is not None
+            else [a.device for a in activations]
+        )
         first_shape = original_shapes[0]
         if any(shape != first_shape for shape in original_shapes):
             raise ValueError(f"All GOP activation shapes must match: {original_shapes}")
@@ -440,6 +501,7 @@ class ActivationCompressor:
             effective_gop = min(int(gop_length or len(activations)), len(activations))
             compressed_dict["compression_mode"] = "inter_layer_gop"
             compressed_dict["codec"] = self.codec
+            compressed_dict["quantization"] = _quantization_name(self.codec, width)
             compressed_dict["original_shapes"] = original_shapes
             compressed_dict["original_dtypes"] = original_dtypes
             compressed_dict["original_devices"] = original_devices
@@ -488,6 +550,16 @@ class ActivationDecompressor:
 
         logger.info(f"[ActivationDecompressor] Initialized with max_pipelines={max_cached_pipelines} per GPU")
 
+    def clear_pipeline_cache(self) -> None:
+        """Drop cached pipeline objects so native NVDEC resources can be freed."""
+        self._pipeline_cache_per_gpu.clear()
+        self._pipeline_access_order_per_gpu.clear()
+        self._sequence_pipeline_cache_per_gpu.clear()
+        self._sequence_pipeline_access_order_per_gpu.clear()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     @staticmethod
     def _codec_type(codec: str):
         return CodecType.H264 if str(codec).lower() == "h264" else CodecType.HEVC
@@ -522,7 +594,7 @@ class ActivationDecompressor:
 
         pipeline = Pipeline([
             AddShape(),
-            CWQuantization(),
+            _make_quantization_step(codec, width),
             FixedTiling(
                 pad_to_shape=[padded_height, padded_width],
                 resize_to_shape=[1, 1, padded_height, padded_width],
@@ -566,7 +638,7 @@ class ActivationDecompressor:
 
         return Pipeline([
             AddShape(),
-            CWQuantization(),
+            _make_quantization_step(codec, width),
             FixedTiling(
                 pad_to_shape=[frame_count, padded_height, padded_width],
                 resize_to_shape=[frame_count, 1, padded_height, padded_width],
@@ -680,15 +752,15 @@ class ActivationDecompressor:
         Returns:
             Decompressed activation tensor with original shape
         """
-        if not NVENC_AVAILABLE:
-            raise RuntimeError("NVENC not available")
-
         original_shape = compressed_dict['original_shape']
         original_dtype = compressed_dict['original_dtype']
         original_device = compressed_dict['original_device']
 
         if target_device is None:
             target_device = original_device
+
+        if not NVENC_AVAILABLE:
+            raise RuntimeError("NVENC not available")
 
         # Get 2D shape
         if len(original_shape) == 3:
@@ -713,7 +785,7 @@ class ActivationDecompressor:
             )
             # For backward pass, we need to handle padding correctly
             # The issue is: FixedTiling.backward outputs padded tensor,
-            # but CWQuantization.backward expects original size
+            # but quantization backward expects original size.
             with device_ctx:
                 # Get pipeline while the target GPU is the active CUDA context.
                 pipeline = self._get_pipeline(
@@ -742,7 +814,7 @@ class ActivationDecompressor:
                 quantized_data = quantized_data[:height, :width]
                 data_dict['data'] = quantized_data
 
-                # Step 4: CWQuantization backward (dequantize with original size)
+                # Step 4: Quantization backward (dequantize with original size)
                 data_dict['shape'] = torch.Size([height, width])
                 data_dict = pipeline.steps[-3].backward(data_dict)
 
@@ -873,8 +945,13 @@ class ActivationDecompressor:
                     quantized_data = frame_dict["data"][:height, :width]
                     frame_dict["data"] = quantized_data
 
-                    row_start = frame_index * height
-                    row_end = row_start + height
+                    rows_per_frame = _quantization_rows_per_frame(
+                        compressed_dict.get("quantization"),
+                        height,
+                        width,
+                    )
+                    row_start = frame_index * rows_per_frame
+                    row_end = row_start + rows_per_frame
                     frame_dict["scale"] = scale[row_start:row_end]
                     frame_dict["offset"] = offset[row_start:row_end]
 
@@ -951,7 +1028,7 @@ def test_compression():
     print(f"Original size: {original_size / 1024 / 1024:.2f} MB")
 
     # Compress
-    compressor = ActivationCompressor(bitrate=5.0, codec="hevc")
+    compressor = ActivationCompressor(bitrate=5.0, codec="lossless")
     import time
     start = time.time()
     compressed = compressor.compress(test_activation, name="test")

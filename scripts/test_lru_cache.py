@@ -10,12 +10,24 @@ print("=" * 60)
 # Create compressor with max_cached_pipelines=2
 compressor = ActivationCompressor(
     bitrate=5.0,
-    codec="hevc",
+    codec="lossless",
     max_cached_pipelines=2,
 )
 
+
+def cache_shapes():
+    return {
+        gpu_id: list(cache.keys())
+        for gpu_id, cache in compressor._pipeline_cache_per_gpu.items()
+    }
+
+
+def cache_size():
+    return sum(len(cache) for cache in compressor._pipeline_cache_per_gpu.values())
+
+
 print(f"\nCompressor created with max_cached_pipelines=2")
-print(f"Current cache size: {len(compressor._pipeline_cache)}")
+print(f"Current cache size: {cache_size()}")
 
 # Test with 3 different shapes to trigger eviction
 shapes = [
@@ -31,8 +43,8 @@ for i, shape in enumerate(shapes, 1):
     try:
         compressed = compressor.compress(test_tensor, name=f"test{i}")
         print(f"✓ Compression successful")
-        print(f"  Cache size: {len(compressor._pipeline_cache)}")
-        print(f"  Cached shapes: {list(compressor._pipeline_cache.keys())}")
+        print(f"  Cache size: {cache_size()}")
+        print(f"  Cached shapes: {cache_shapes()}")
         print(f"  Compressed size: {compressed['code_size'] / 1024 / 1024:.2f} MB")
     except Exception as e:
         print(f"✗ Compression failed: {e}")
@@ -42,8 +54,8 @@ print(f"\n--- Test 4: Re-access Shape 2 (should hit cache) ---")
 test_tensor = torch.randn(1, 2000, 3072, dtype=torch.float16, device='cuda')
 compressed = compressor.compress(test_tensor, name="test4")
 print(f"✓ Compression successful (cache hit)")
-print(f"  Cache size: {len(compressor._pipeline_cache)}")
-print(f"  Cached shapes: {list(compressor._pipeline_cache.keys())}")
+print(f"  Cache size: {cache_size()}")
+print(f"  Cached shapes: {cache_shapes()}")
 
 print("\n" + "=" * 60)
 print("✅ LRU caching test completed!")

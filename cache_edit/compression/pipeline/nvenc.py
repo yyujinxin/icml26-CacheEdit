@@ -10,6 +10,19 @@ from .. import TensorDecoder
 import os
 import sys
 import gc
+import ctypes
+import threading
+
+
+_libc = ctypes.CDLL(None)
+_native_stdout_lock = threading.RLock()
+
+
+def _flush_native_stdio():
+    try:
+        _libc.fflush(None)
+    except Exception:
+        pass
 
 
 def _encoded_tensors(encoded):
@@ -20,18 +33,32 @@ def _encoded_tensors(encoded):
 
 @contextmanager
 def _suppress_native_stdout():
-    sys.stdout.flush()
-    saved_stdout = os.dup(1)
-    try:
-        with open(os.devnull, "w") as devnull:
-            os.dup2(devnull.fileno(), 1)
-            yield
-            sys.stdout.flush()
-    finally:
+    # fd 1/2 are process-global. Async compression can call into this helper
+    # from multiple threads, so serialize dup2 restore pairs to avoid leaking
+    # stdout/stderr to /dev/null or to a stale saved fd.
+    with _native_stdout_lock:
         sys.stdout.flush()
-        gc.collect()
-        os.dup2(saved_stdout, 1)
-        os.close(saved_stdout)
+        sys.stderr.flush()
+        _flush_native_stdio()
+        saved_stdout = os.dup(1)
+        saved_stderr = os.dup(2)
+        try:
+            with open(os.devnull, "w") as devnull:
+                os.dup2(devnull.fileno(), 1)
+                os.dup2(devnull.fileno(), 2)
+                yield
+                sys.stdout.flush()
+                sys.stderr.flush()
+                _flush_native_stdio()
+        finally:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            _flush_native_stdio()
+            gc.collect()
+            os.dup2(saved_stdout, 1)
+            os.dup2(saved_stderr, 2)
+            os.close(saved_stdout)
+            os.close(saved_stderr)
 
 
 class FixedTiling(Step):
@@ -188,7 +215,8 @@ class NVEncode(Step):
                     total_size += encoded.packet_sizes.sum().item()
                     ret.append(encoded)
             finally:
-                # Explicitly delete encoder to free NVENC resources
+                if hasattr(encoder, "close"):
+                    encoder.close()
                 del encoder
 
         # print("Total size: ", total_size)
@@ -210,7 +238,8 @@ class NVEncode(Step):
                     assert decoded.numel() != 0, "Decoded tensor is empty"
                     ret.append(decoded)
             finally:
-                # Explicitly delete decoder to free NVDEC resources
+                if hasattr(decoder, "close"):
+                    decoder.close()
                 del decoder
 
         data_dict["data"] = torch.stack(ret)
@@ -288,7 +317,8 @@ class MonoNVEncode(Step):
                     total_size += encoded.packet_sizes.sum().item()
                     ret.append(encoded)
             finally:
-                # Explicitly delete encoder to free NVENC resources
+                if hasattr(encoder, "close"):
+                    encoder.close()
                 del encoder
 
         # print("Total size: ", total_size)
@@ -312,7 +342,8 @@ class MonoNVEncode(Step):
                     assert decoded.numel() != 0, "Decoded tensor is empty"
                     ret.append(tensor)
             finally:
-                # Explicitly delete decoder to free NVDEC resources
+                if hasattr(decoder, "close"):
+                    decoder.close()
                 del decoder
 
         data_dict["data"] = torch.stack(ret)
@@ -371,8 +402,9 @@ class MonoNVEncodeSequence(Step):
         ret = []
         total_size = 0
         with _suppress_native_stdout():
-            encoder = TensorEncoder(self.config, self.width, self.height)
+            encoder = None
             try:
+                encoder = TensorEncoder(self.config, self.width, self.height)
                 for tile_idx in range(num_tiles):
                     tile_sequence = x[:, tile_idx].squeeze(1).squeeze(1).contiguous()
                     assert tile_sequence.shape[0] == frame_count
@@ -381,7 +413,10 @@ class MonoNVEncodeSequence(Step):
                     total_size += encoded.packet_sizes.sum().item()
                     ret.append(encoded)
             finally:
-                del encoder
+                if encoder is not None and hasattr(encoder, "close"):
+                    encoder.close()
+                if encoder is not None:
+                    del encoder
 
         data_dict["data"] = ret
         data_dict["code_size"] = total_size
@@ -393,15 +428,19 @@ class MonoNVEncodeSequence(Step):
         ret = []
 
         with _suppress_native_stdout():
-            decoder = TensorDecoder(self.config.codec_type, self.width, self.height)
+            decoder = None
             try:
+                decoder = TensorDecoder(self.config.codec_type, self.width, self.height)
                 for tile_idx in range(len(bitstreams)):
                     bitstream, packet_sizes = _encoded_tensors(bitstreams[tile_idx])
                     decoded = decoder.decode(bitstream, packet_sizes)
                     assert decoded.numel() != 0, "Decoded tensor is empty"
                     ret.append(self.convert_monochrome_to_tensor(decoded))
             finally:
-                del decoder
+                if decoder is not None and hasattr(decoder, "close"):
+                    decoder.close()
+                if decoder is not None:
+                    del decoder
 
         # [tiles, frames, H, W] -> [frames, tiles, 1, 1, H, W]
         data_dict["data"] = torch.stack(ret, dim=1).unsqueeze(2).unsqueeze(2)

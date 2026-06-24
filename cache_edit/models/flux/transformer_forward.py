@@ -86,6 +86,24 @@ def _move_if_needed(tensor: Optional[torch.Tensor], device: torch.device):
     return tensor.to(device)
 
 
+def _validated_key_token_indices_cpu(
+    key_token_indices: Optional[torch.Tensor],
+    *,
+    token_len: int,
+) -> Optional[torch.Tensor]:
+    if key_token_indices is None:
+        return None
+    try:
+        indices = key_token_indices.detach().flatten().to("cpu").long()
+        if indices.numel() == 0:
+            return indices
+        if int(indices.min().item()) < 0 or int(indices.max().item()) >= int(token_len):
+            return None
+        return indices
+    except Exception:
+        return None
+
+
 @dataclass
 class FluxCacheVizConfig:
     """
@@ -125,7 +143,7 @@ def _resolve_ref_for_key_token_update(
     if viz_config is not None:
         stream = viz_config.ref_stream or "single"
         layer_idx = viz_config.ref_layer_idx
-    return ctx.load_activation(
+    return ctx.load_key_token_ref(
         stream=stream,
         layer_idx=layer_idx,
         device=hidden_states.device,
@@ -347,40 +365,57 @@ def cache_flux_transformer_2d_forward(
             joint_attention_kwargs, block_device
         )
 
-        if torch.is_grad_enabled() and getattr(self, "gradient_checkpointing", False):
-            encoder_hidden_states, hidden_states = self._gradient_checkpointing_func(
-                block,
-                hidden_states,
-                encoder_hidden_states,
-                temb,
-                image_rotary_emb_for_block,
-                joint_attention_kwargs_for_block,
-            )
-        else:
-            encoder_hidden_states, hidden_states = block(
-                hidden_states=hidden_states,
-                encoder_hidden_states=encoder_hidden_states,
-                temb=temb,
-                image_rotary_emb=image_rotary_emb_for_block,
-                joint_attention_kwargs=joint_attention_kwargs_for_block,
-            )
-
+        cached_prev = None
         if should_reuse:
-            prev = ctx.load_activation(
+            cached_prev = ctx.load_activation(
                 stream="double",
                 layer_idx=index_block,
-                device=hidden_states.device,
+                device=block_device,
             )
-            if prev is not None and ctx.key_token_indices is not None:
-                mask_prev = torch.ones(
-                    prev.size(1), dtype=torch.bool, device=prev.device
+        key_token_indices_for_block = ctx.key_token_indices
+        effective_key_token_indices = None
+        if should_reuse and cached_prev is not None and key_token_indices_for_block is not None:
+            effective_key_token_indices = _validated_key_token_indices_cpu(
+                key_token_indices_for_block,
+                token_len=int(cached_prev.size(1)),
+            )
+        if (
+            should_reuse
+            and key_token_indices_for_block is not None
+            and (cached_prev is None or effective_key_token_indices is None)
+        ):
+            ctx.key_token_indices = None
+        elif should_reuse and effective_key_token_indices is not None:
+            ctx.key_token_indices = effective_key_token_indices.to(block_device)
+        try:
+            if torch.is_grad_enabled() and getattr(self, "gradient_checkpointing", False):
+                encoder_hidden_states, hidden_states = self._gradient_checkpointing_func(
+                    block,
+                    hidden_states,
+                    encoder_hidden_states,
+                    temb,
+                    image_rotary_emb_for_block,
+                    joint_attention_kwargs_for_block,
                 )
-                kti = ctx.key_token_indices
-                if kti.device != prev.device:
-                    kti = kti.to(prev.device)
-                mask_prev[kti] = False
-                prev = prev[:, mask_prev, :]
+            else:
+                encoder_hidden_states, hidden_states = block(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    temb=temb,
+                    image_rotary_emb=image_rotary_emb_for_block,
+                    joint_attention_kwargs=joint_attention_kwargs_for_block,
+                )
+        finally:
+            ctx.key_token_indices = key_token_indices_for_block
+
+        if should_reuse:
+            prev = cached_prev
+            if prev is not None and effective_key_token_indices is not None:
+                mask_prev_cpu = torch.ones(prev.size(1), dtype=torch.bool)
+                mask_prev_cpu[effective_key_token_indices] = False
+                prev = prev[:, mask_prev_cpu.to(prev.device), :]
                 hidden_states = torch.cat((hidden_states, prev), dim=1)
+            del cached_prev
 
         ctx.maby_store_activation(
             stream="double",
@@ -424,40 +459,57 @@ def cache_flux_transformer_2d_forward(
             joint_attention_kwargs, block_device
         )
 
-        if torch.is_grad_enabled() and getattr(self, "gradient_checkpointing", False):
-            encoder_hidden_states, hidden_states = self._gradient_checkpointing_func(
-                block,
-                hidden_states,
-                encoder_hidden_states,
-                temb,
-                image_rotary_emb_for_block,
-                joint_attention_kwargs_for_block,
-            )
-        else:
-            encoder_hidden_states, hidden_states = block(
-                hidden_states=hidden_states,
-                encoder_hidden_states=encoder_hidden_states,
-                temb=temb,
-                image_rotary_emb=image_rotary_emb_for_block,
-                joint_attention_kwargs=joint_attention_kwargs_for_block,
-            )
-
+        cached_prev = None
         if should_reuse:
-            prev = ctx.load_activation(
+            cached_prev = ctx.load_activation(
                 stream="single",
                 layer_idx=index_block,
-                device=hidden_states.device,
+                device=block_device,
             )
-            if prev is not None and ctx.key_token_indices is not None:
-                mask_prev = torch.ones(
-                    prev.size(1), dtype=torch.bool, device=prev.device
+        key_token_indices_for_block = ctx.key_token_indices
+        effective_key_token_indices = None
+        if should_reuse and cached_prev is not None and key_token_indices_for_block is not None:
+            effective_key_token_indices = _validated_key_token_indices_cpu(
+                key_token_indices_for_block,
+                token_len=int(cached_prev.size(1)),
+            )
+        if (
+            should_reuse
+            and key_token_indices_for_block is not None
+            and (cached_prev is None or effective_key_token_indices is None)
+        ):
+            ctx.key_token_indices = None
+        elif should_reuse and effective_key_token_indices is not None:
+            ctx.key_token_indices = effective_key_token_indices.to(block_device)
+        try:
+            if torch.is_grad_enabled() and getattr(self, "gradient_checkpointing", False):
+                encoder_hidden_states, hidden_states = self._gradient_checkpointing_func(
+                    block,
+                    hidden_states,
+                    encoder_hidden_states,
+                    temb,
+                    image_rotary_emb_for_block,
+                    joint_attention_kwargs_for_block,
                 )
-                kti = ctx.key_token_indices
-                if kti.device != prev.device:
-                    kti = kti.to(prev.device)
-                mask_prev[kti] = False
-                prev = prev[:, mask_prev, :]
+            else:
+                encoder_hidden_states, hidden_states = block(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    temb=temb,
+                    image_rotary_emb=image_rotary_emb_for_block,
+                    joint_attention_kwargs=joint_attention_kwargs_for_block,
+                )
+        finally:
+            ctx.key_token_indices = key_token_indices_for_block
+
+        if should_reuse:
+            prev = cached_prev
+            if prev is not None and effective_key_token_indices is not None:
+                mask_prev_cpu = torch.ones(prev.size(1), dtype=torch.bool)
+                mask_prev_cpu[effective_key_token_indices] = False
+                prev = prev[:, mask_prev_cpu.to(prev.device), :]
                 hidden_states = torch.cat((hidden_states, prev), dim=1)
+            del cached_prev
 
         ctx.maby_store_activation(
             stream="single",

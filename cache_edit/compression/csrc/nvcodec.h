@@ -81,12 +81,13 @@ class TensorEncoder {
 public:
     TensorEncoder(const TensorEncodeConfig& config, uint32_t maxWidth, uint32_t maxHeight);
     ~TensorEncoder();
+    void close();
     TensorEncodeOutput encode(torch::Tensor input);
 private:
     std::unique_ptr<NvEncoderOutputInVidMemCuda> nv_encoder;
     CUcontext torch_cu_context;
     CUstream torch_cu_stream;
-    NV_ENC_ENCODE_OUT_PARAMS *output_params_host;
+    NV_ENC_ENCODE_OUT_PARAMS *output_params_host = nullptr;
     NV_ENC_BUFFER_FORMAT buffer_format;
     bool monochrome;
 };
@@ -94,6 +95,8 @@ private:
 class TensorDecoder {
 public:
     TensorDecoder(CodecType codec_type, int maxWidth, int maxHeight);
+    ~TensorDecoder();
+    void close();
     torch::Tensor decode(torch::Tensor bitstream, torch::Tensor packet_sizes);
 private:
     std::unique_ptr<NvDecoder> nv_decoder;

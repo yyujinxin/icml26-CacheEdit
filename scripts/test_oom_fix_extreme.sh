@@ -16,7 +16,7 @@ echo "  - Cache interval: 5 (cache steps: 0, 5, 10, 15, 20, 25)"
 echo "  - GPU memory limit: 16GB"
 echo "  - GPU memory buffer: 5GB"
 echo "  - Inference steps: 28"
-echo "  - Compression: HEVC 5Mbps"
+echo "  - Compression: lossless codec (bitrate ignored)"
 echo ""
 
 python scripts/run_flux_multi_gpu_optimized.py \
@@ -30,7 +30,9 @@ python scripts/run_flux_multi_gpu_optimized.py \
     --use-cache \
     --use-cache-compression \
     --compression-bitrate 5.0 \
-    --compression-codec hevc \
+    --compression-codec lossless \
+    --compression-gop-length 16 \
+    --compression-frame-interval-p 16 \
     --num-inference-steps 2 \
     --cache-interval 5 \
     --guidance-scale 3.5 \

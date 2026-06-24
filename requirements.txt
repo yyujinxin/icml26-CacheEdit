@@ -18,3 +18,4 @@ requests>=2.31.0
 # Optional dependencies (install separately if needed)
 # flash-attn>=2.5.0  # For flash attention optimization
 # fused-kernels      # For fused kernel operations
+lpips>=0.1.4         # For PSNR/SSIM/LPIPS quality evaluation scripts

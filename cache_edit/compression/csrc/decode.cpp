@@ -34,6 +34,16 @@ TensorDecoder::TensorDecoder(CodecType codec_type, int maxWidth, int maxHeight) 
     ));
 }
 
+TensorDecoder::~TensorDecoder() {
+    close();
+}
+
+void TensorDecoder::close() {
+    if (nv_decoder) {
+        nv_decoder.reset();
+    }
+}
+
 torch::Tensor TensorDecoder::decode(torch::Tensor bitstream, torch::Tensor packet_sizes) {
     bitstream = bitstream.to(torch::kCPU);
     packet_sizes = packet_sizes.to(torch::kCPU);
@@ -76,20 +86,22 @@ torch::Tensor TensorDecoder::decode(torch::Tensor bitstream, torch::Tensor packe
             frame_size = nv_decoder->GetFrameSize();
             output_tensor.resize_({static_cast<int64_t>(frame_size) * static_cast<int64_t>(num_packets)});
         }
-        if (output_tensor_offset + frame_size > output_tensor.numel()) {
-            output_tensor.resize_({output_tensor.numel() * 2});
-        }
         assert(nv_decoder->GetWidth() == nv_decoder->GetDecodeWidth());
-        for (int i = 0; i < num_frames_return; i++) {
+        for (int frame_idx = 0; frame_idx < num_frames_return; frame_idx++) {
+            if (output_tensor_offset + frame_size > output_tensor.numel()) {
+                output_tensor.resize_({output_tensor.numel() * 2});
+            }
             uint8_t* p_frame = nv_decoder->GetFrame();
             ck(cuMemcpyDtoD(
                 (CUdeviceptr)(output_tensor.data_ptr<uint8_t>() + output_tensor_offset),
                 (CUdeviceptr)p_frame,
                 frame_size
             ));
+            // P-frame GOPs may return several decoded frames in one Decode()
+            // call, especially on flush. Each frame needs its own output slot.
+            output_tensor_offset += frame_size;
+            num_frames++;
         }
-        output_tensor_offset += frame_size;
-        num_frames += num_frames_return;
     }
 
     output_tensor.resize_({static_cast<int64_t>(frame_size) * static_cast<int64_t>(num_frames)});

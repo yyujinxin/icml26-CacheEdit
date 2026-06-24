@@ -64,9 +64,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     py::class_<TensorEncoder>(m, "TensorEncoder")
         .def(py::init<const TensorEncodeConfig&, uint32_t, uint32_t>())
+        .def("close", &TensorEncoder::close)
         .def("encode", &TensorEncoder::encode);
 
     py::class_<TensorDecoder>(m, "TensorDecoder")
         .def(py::init<CodecType, int, int>())
+        .def("close", &TensorDecoder::close)
         .def("decode", &TensorDecoder::decode);
 }

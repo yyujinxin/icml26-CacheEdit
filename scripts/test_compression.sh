@@ -32,16 +32,18 @@ python scripts/run_flux_multi_gpu_optimized.py \
     --gpu-memory-buffer-gb 3
 
 echo ""
-echo "Test 2: Run with HEVC compression @ 5 Mbps"
+echo "Test 2: Run with lossless codec compression"
 echo "=========================================="
 python scripts/run_flux_multi_gpu_optimized.py \
     --model-path "$MODEL_PATH" \
     --data-root "$DATA_ROOT" \
-    --output-dir "${OUTPUT_DIR}_hevc_5mbps" \
+    --output-dir "${OUTPUT_DIR}_lossless_gop16" \
     --use-cache \
     --use-cache-compression \
     --compression-bitrate 5.0 \
-    --compression-codec hevc \
+    --compression-codec lossless \
+    --compression-gop-length 16 \
+    --compression-frame-interval-p 16 \
     --num-inference-steps 28 \
     --cache-interval 5 \
     --guidance-scale 3.5 \
@@ -51,16 +53,18 @@ python scripts/run_flux_multi_gpu_optimized.py \
     --gpu-memory-buffer-gb 3
 
 echo ""
-echo "Test 3: Run with HEVC compression @ 3 Mbps (higher compression)"
+echo "Test 3: Run with lossy HEVC compression @ 5 Mbps"
 echo "=========================================="
 python scripts/run_flux_multi_gpu_optimized.py \
     --model-path "$MODEL_PATH" \
     --data-root "$DATA_ROOT" \
-    --output-dir "${OUTPUT_DIR}_hevc_3mbps" \
+    --output-dir "${OUTPUT_DIR}_hevc_5mbps" \
     --use-cache \
     --use-cache-compression \
-    --compression-bitrate 3.0 \
+    --compression-bitrate 5.0 \
     --compression-codec hevc \
+    --compression-gop-length 16 \
+    --compression-frame-interval-p 16 \
     --num-inference-steps 28 \
     --cache-interval 5 \
     --guidance-scale 3.5 \
@@ -76,5 +80,5 @@ echo "=========================================="
 echo ""
 echo "Compare results in:"
 echo "  - ${OUTPUT_DIR}_no_compression"
+echo "  - ${OUTPUT_DIR}_lossless_gop16"
 echo "  - ${OUTPUT_DIR}_hevc_5mbps"
-echo "  - ${OUTPUT_DIR}_hevc_3mbps"

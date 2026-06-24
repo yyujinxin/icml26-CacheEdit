@@ -10,7 +10,7 @@ print("=" * 60)
 # Create compressor
 compressor = ActivationCompressor(
     bitrate=5.0,
-    codec="hevc",
+    codec="lossless",
     max_cached_pipelines=1,  # Only 1 pipeline to stress test
 )
 

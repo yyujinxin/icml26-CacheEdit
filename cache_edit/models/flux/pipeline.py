@@ -549,7 +549,7 @@ def create_default_cache_manager(
     gpu_memory_buffer_gb: float = 1.0,
     use_compression: bool = False,
     compression_bitrate: float = 5.0,
-    compression_codec: str = "hevc",
+    compression_codec: str = "lossless",
     compression_gop_length: int = 1,
     compression_frame_interval_p: int = 1,
 ) -> FluxCacheManager:
@@ -567,8 +567,9 @@ def create_default_cache_manager(
         gpu_memory_limit_gb: 每张 GPU 显存上限（GB），None 时自动检测
         gpu_memory_buffer_gb: 显存预留 buffer（GB），防止 OOM
         use_compression: 是否使用 LLM.265 NVENC 压缩
-        compression_bitrate: 压缩码率（Mbps），1-10 典型值
-        compression_codec: 视频编解码器，'hevc' 或 'h264'
+        compression_bitrate: 压缩码率（Mbps），仅 hevc/h264 使用
+        compression_codec: 'lossless' 使用 HEVC/NVENC lossless 编码量化帧；
+            'hevc'/'h264' 为有损视频编解码器
         compression_gop_length: 连续 layer 帧间压缩 GOP 长度；<=1 表示全 I 帧
         compression_frame_interval_p: P 帧间隔；1 表示 IPPP
     """

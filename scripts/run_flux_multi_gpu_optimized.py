@@ -43,6 +43,54 @@ def extract_instructions(row: dict):
     return [p for _, p in items]
 
 
+def expected_generation_paths(output_dir: str, key: str, prompts):
+    gen_dir = Path(output_dir) / "generation"
+    return [
+        gen_dir / f"{key}_r{r}_{sanitize(prompt)}.png"
+        for r, prompt in enumerate(prompts)
+    ]
+
+
+def image_outputs_complete(output_dir: str, key: str, prompts) -> bool:
+    return all(path.is_file() for path in expected_generation_paths(output_dir, key, prompts))
+
+
+def write_timing_report(path: Path, args, all_timings, cache_manager=None, final: bool = False):
+    flat = [t for ts in all_timings.values() for t in ts]
+    summary = {
+        "use_cache": args.use_cache,
+        "num_images": len(all_timings),
+        "avg_round_time": sum(flat) / len(flat) if flat else 0.0,
+        "per_image_round_times": all_timings,
+        "complete": bool(final),
+    }
+    if (
+        args.use_cache
+        and cache_manager is not None
+        and hasattr(cache_manager, "get_compression_report")
+    ):
+        summary["compression"] = cache_manager.get_compression_report(
+            include_records=final
+        )
+    else:
+        summary["compression"] = {
+            "summary": {
+                "enabled": False,
+                "attempt_count": 0,
+                "success_count": 0,
+                "failure_count": 0,
+            },
+            "compression_records": [],
+            "decompression_records": [],
+        }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp_path, "w") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+    os.replace(tmp_path, path)
+    return summary
+
+
 class MultiGPUMemoryManager:
     """Manages activation memory across multiple GPUs."""
 
@@ -472,13 +520,18 @@ def get_args():
     p.add_argument("--use-cache-compression", action="store_true",
                    help="Use LLM.265 NVENC compression for activation cache")
     p.add_argument("--compression-bitrate", type=float, default=5.0,
-                   help="Compression bitrate in Mbps (1-10, default: 5.0)")
-    p.add_argument("--compression-codec", choices=["hevc", "h264"], default="hevc",
-                   help="Video codec for compression (default: hevc)")
+                   help="Compression bitrate in Mbps for hevc/h264; ignored by lossless")
+    p.add_argument("--compression-codec", choices=["lossless", "hevc", "h264"], default="lossless",
+                   help="Compression codec: hevc/h264 are lossy NVENC paths; lossless uses HEVC/NVENC lossless over quantized frames")
     p.add_argument("--compression-gop-length", type=int, default=1,
                    help="Inter-layer GOP length for activation compression; <=1 keeps all-I frames")
     p.add_argument("--compression-frame-interval-p", type=int, default=1,
                    help="P-frame interval for inter-layer GOP compression (1 = IPPP)")
+    p.add_argument(
+        "--resume-skip-complete",
+        action="store_true",
+        help="Skip images whose expected round output files already exist.",
+    )
     return p.parse_args()
 
 
@@ -536,40 +589,29 @@ def main():
     if args.offload_encoders:
         offload_encoders_to_cpu(pipeline)
 
-    all_timings = {}
-    for row in selected:
-        key = row.get("image_idx") or row["file_name"]
-        all_timings[key] = run_image(pipeline, cache_manager, memory_manager, row, args)
-
     os.makedirs(args.output_dir, exist_ok=True)
-    flat = [t for ts in all_timings.values() for t in ts]
-    summary = {
-        "use_cache": args.use_cache,
-        "num_images": len(all_timings),
-        "avg_round_time": sum(flat) / len(flat) if flat else 0.0,
-        "per_image_round_times": all_timings,
-    }
-    if (
-        args.use_cache
-        and cache_manager is not None
-        and hasattr(cache_manager, "get_compression_report")
-    ):
-        summary["compression"] = cache_manager.get_compression_report()
-    else:
-        summary["compression"] = {
-            "summary": {
-                "enabled": False,
-                "attempt_count": 0,
-                "success_count": 0,
-                "failure_count": 0,
-            },
-            "compression_records": [],
-            "decompression_records": [],
-        }
+    partial_report_path = Path(args.output_dir) / "timings.partial.json"
+    all_timings = {}
+    for row_index, row in enumerate(selected):
+        key = row.get("image_idx") or row["file_name"]
+        prompts = extract_instructions(row)
+        if args.max_rounds is not None:
+            prompts = prompts[:args.max_rounds]
+        if args.resume_skip_complete and image_outputs_complete(args.output_dir, str(key), prompts):
+            print(f"[resume] skip complete image {key} ({row_index + 1}/{len(selected)})", flush=True)
+            all_timings[key] = []
+            write_timing_report(partial_report_path, args, all_timings, cache_manager, final=False)
+            continue
+
+        try:
+            all_timings[key] = run_image(pipeline, cache_manager, memory_manager, row, args)
+            write_timing_report(partial_report_path, args, all_timings, cache_manager, final=False)
+        except BaseException:
+            write_timing_report(partial_report_path, args, all_timings, cache_manager, final=False)
+            raise
 
     report_path = Path(args.output_dir) / "timings.json"
-    with open(report_path, "w") as f:
-        json.dump(summary, f, indent=2, ensure_ascii=False)
+    summary = write_timing_report(report_path, args, all_timings, cache_manager, final=True)
 
     print(f"\navg round time: {summary['avg_round_time']:.2f}s")
     comp_summary = summary["compression"]["summary"]

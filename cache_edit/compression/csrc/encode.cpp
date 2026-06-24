@@ -152,7 +152,17 @@ TensorEncoder::TensorEncoder(const TensorEncodeConfig& config, uint32_t maxWidth
 }
 
 TensorEncoder::~TensorEncoder() {
-	cuMemFreeHost(output_params_host);
+    close();
+}
+
+void TensorEncoder::close() {
+    if (nv_encoder) {
+        nv_encoder.reset();
+    }
+    if (output_params_host != nullptr) {
+        cuMemFreeHost(output_params_host);
+        output_params_host = nullptr;
+    }
 }
 
 TensorEncodeOutput TensorEncoder::encode(torch::Tensor input) {

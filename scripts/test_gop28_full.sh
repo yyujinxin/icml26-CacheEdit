@@ -18,7 +18,7 @@ MODEL_PATH="/mnt/data/models/black-forest-labs/FLUX___1-Kontext-dev"
 DATA_ROOT="/mnt/data/datasets/test"
 
 # Output directory for generated images, timings.json, and compression report.
-OUTPUT_DIR="./outputs/flux_28step_gop16_P16"
+OUTPUT_DIR="./outputs/flux_28step_lossless_gop16"
 
 # Image id from the dataset metadata to run. 0000 runs the first configured case.
 IMAGE_IDX="0000"
@@ -48,20 +48,19 @@ THRESHOLD="0.97"
 # Random seed for deterministic generation when the rest of the environment is stable.
 SEED="42"
 
-# NVENC codec used for activation compression. hevc usually gives better
-# compression than h264 at the same bitrate.
-COMPRESSION_CODEC="hevc"
+# Activation compression codec. lossless uses HEVC/NVENC lossless mode after
+# FP16 activations are quantized to uint8 frames; hevc/h264 use lossy NVENC.
+COMPRESSION_CODEC="lossless"
 
-# NVENC bitrate in Mbps. Higher bitrate improves reconstructed activation
-# accuracy but lowers compression ratio and increases payload size.
+# NVENC bitrate in Mbps. Ignored by COMPRESSION_CODEC=lossless; only used by
+# hevc/h264 lossy video compression.
 COMPRESSION_BITRATE="5.0"
 
-# Inter-layer GOP length. Consecutive transformer layers are encoded as frames
-# in one GOP; larger values can improve compression ratio but may increase error.
+# Inter-layer GOP length. Consecutive transformer layers are encoded as codec
+# frames. In lossless mode the codec itself is lossless for the quantized frames.
 COMPRESSION_GOP_LENGTH="16"
 
-# Distance between P frames in the GOP. 1 means IPPP... and enables dense
-# inter-frame prediction between adjacent layers.
+# P-frame interval inside the NVENC GOP.
 COMPRESSION_FRAME_INTERVAL_P="16"
 
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF_VALUE}"
@@ -75,7 +74,11 @@ echo "  - Image idx: ${IMAGE_IDX}"
 echo "  - Output dir: ${OUTPUT_DIR}"
 echo "  - Inference steps: ${NUM_INFERENCE_STEPS}"
 echo "  - Cache interval: ${CACHE_INTERVAL} (28-step cache steps: 0, 5, 10, 15, 20, 25)"
-echo "  - Compression: ${COMPRESSION_CODEC} ${COMPRESSION_BITRATE}Mbps"
+if [[ "${COMPRESSION_CODEC}" == "lossless" ]]; then
+    echo "  - Compression: ${COMPRESSION_CODEC} codec (bitrate ignored)"
+else
+    echo "  - Compression: ${COMPRESSION_CODEC} ${COMPRESSION_BITRATE}Mbps"
+fi
 echo "  - Inter-layer GOP: length=${COMPRESSION_GOP_LENGTH}, frame_interval_p=${COMPRESSION_FRAME_INTERVAL_P}"
 echo "  - GPUs: ${NUM_GPUS}, memory limit=${GPU_MEMORY_LIMIT_GB}GB, buffer=${GPU_MEMORY_BUFFER_GB}GB"
 echo ""
