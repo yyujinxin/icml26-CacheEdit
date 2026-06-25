@@ -82,6 +82,10 @@ conda activate cacheedit
 python scripts/build_cacheedit_ops.py
 ```
 
+On this single-GPU setup there is no system CUDA toolkit, so the build needs a
+few extra steps (pip nvcc, a `libcudart.so` symlink, matplotlib). The full
+procedure is in [docs/BUILD_NVENC.md](docs/BUILD_NVENC.md).
+
 ## Data And Model Layout
 
 The default scripts assume:
