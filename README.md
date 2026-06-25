@@ -42,15 +42,34 @@ Important constraints:
 
 ## Environment
 
-Typical local setup:
+This branch (`a6000pro`) is adapted for a **single NVIDIA RTX PRO 6000
+(Blackwell, 96GB)**. Blackwell is compute capability `sm_120`, so it needs a
+PyTorch build with CUDA 12.8+ (cu128/cu130). Typical setup with conda:
 
 ```bash
 cd /home/yujinxin/icml26-CacheEdit
-python3.10 -m venv .venv
-source .venv/bin/activate
+
+# Create and activate the environment.
+conda create -n cacheedit python=3.10 -y
+conda activate cacheedit
+
+# PyTorch with Blackwell (sm_120) support. The default PyPI wheel ships cu13
+# runtime libs; verify torch.cuda.get_arch_list() includes 'sm_120'.
+pip install torch torchvision
+
 pip install -r requirements.txt
 pip install -e .
 ```
+
+Verify the GPU is visible to PyTorch:
+
+```bash
+python -c "import torch; print(torch.cuda.get_device_name(0), torch.cuda.get_arch_list())"
+```
+
+The single-GPU runner keeps the whole pipeline resident on the GPU by default
+(no CPU offload), which suits the 96GB card. On smaller cards, pass
+`--cpu-offload` to stream transformer layers from CPU on demand.
 
 The compression path also needs a working NVIDIA driver, CUDA, NVENC/NVDEC, and
 the local LLM.265 / NVIDIA Video Codec SDK sources expected by
@@ -59,7 +78,7 @@ the local LLM.265 / NVIDIA Video Codec SDK sources expected by
 If the native extension has changed or is missing, rebuild it:
 
 ```bash
-source .venv/bin/activate
+conda activate cacheedit
 python scripts/build_cacheedit_ops.py
 ```
 
@@ -68,8 +87,8 @@ python scripts/build_cacheedit_ops.py
 The default scripts assume:
 
 ```text
-model:   /mnt/data/models/black-forest-labs/FLUX___1-Kontext-dev
-dataset: /mnt/data/datasets/test
+model:   /home/yujinxin/model/black-forest-labs/FLUX___1-Kontext-dev
+dataset: /home/yujinxin/dataset/test
 ```
 
 The dataset root should contain metadata plus input images. The optimized runner
@@ -115,17 +134,17 @@ scripts intentionally do not rely on environment-variable parameter injection.
 ## Direct Runner Example
 
 ```bash
-source .venv/bin/activate
+conda activate cacheedit
 
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 python scripts/run_flux_multi_gpu_optimized.py \
-    --model-path /mnt/data/models/black-forest-labs/FLUX___1-Kontext-dev \
-    --data-root /mnt/data/datasets/test \
+    --model-path /home/yujinxin/model/black-forest-labs/FLUX___1-Kontext-dev \
+    --data-root /home/yujinxin/dataset/test \
     --output-dir ./outputs/flux_28step_lossless_gop16 \
     --image-idx 0000 \
-    --num-gpus 4 \
-    --gpu-memory-limit-gb 16.0 \
-    --gpu-memory-buffer-gb 5.0 \
+    --num-gpus 1 \
+    --gpu-memory-limit-gb 90.0 \
+    --gpu-memory-buffer-gb 6.0 \
     --num-inference-steps 28 \
     --guidance-scale 3.5 \
     --seed 42 \
@@ -217,7 +236,7 @@ context and resource-stability problems.
 Fast syntax checks:
 
 ```bash
-source .venv/bin/activate
+conda activate cacheedit
 python -m py_compile \
     cache_edit/compression/activation_compressor.py \
     cache_edit/compression/pipeline/nvenc.py \

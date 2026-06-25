@@ -4,7 +4,9 @@
 
 set -euo pipefail
 
-source .venv/bin/activate
+# Activate the conda environment (single RTX PRO 6000 setup).
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate cacheedit
 
 # Edit parameters in this block directly.
 
@@ -13,10 +15,10 @@ source .venv/bin/activate
 PYTORCH_CUDA_ALLOC_CONF_VALUE="expandable_segments:True"
 
 # Local FLUX-Kontext model directory.
-MODEL_PATH="/mnt/data/models/black-forest-labs/FLUX___1-Kontext-dev"
+MODEL_PATH="/home/yujinxin/model/black-forest-labs/FLUX___1-Kontext-dev"
 
 # Dataset root. The runner reads metadata and input images from this directory.
-DATA_ROOT="/mnt/data/datasets/test"
+DATA_ROOT="/home/yujinxin/dataset/test"
 
 # Image id from the dataset metadata. 0000 is the cat example used in prior tests.
 IMAGE_IDX="0000"
@@ -27,14 +29,14 @@ MAX_ROUNDS="8"
 # Shared output root. Each mode writes into a subdirectory here.
 OUTPUT_ROOT="./outputs/cache_quality_metrics_28step_8round"
 
-# Number of GPUs used by the optimized multi-GPU runner.
-NUM_GPUS="4"
+# Number of GPUs. Single RTX PRO 6000 (96GB): keep this at 1.
+NUM_GPUS="1"
 
-# Soft per-GPU memory limit in GiB used by the offload/cache manager.
-GPU_MEMORY_LIMIT_GB="16.0"
+# Soft GPU memory limit in GiB used by the offload/cache manager on the 96GB card.
+GPU_MEMORY_LIMIT_GB="90.0"
 
-# Extra GiB kept free as a safety buffer before placing tensors on a GPU.
-GPU_MEMORY_BUFFER_GB="5.0"
+# Extra GiB kept free as a safety buffer before placing tensors on the GPU.
+GPU_MEMORY_BUFFER_GB="6.0"
 
 # Number of denoising steps.
 NUM_INFERENCE_STEPS="28"

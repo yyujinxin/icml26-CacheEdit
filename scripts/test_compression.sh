@@ -7,12 +7,13 @@ echo "=========================================="
 echo "Testing CacheEdit with Compression"
 echo "=========================================="
 
-# Activate environment
-source .venv/bin/activate
+# Activate the conda environment (single RTX PRO 6000 setup).
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate cacheedit
 
 # Test parameters
-MODEL_PATH="/mnt/data/models/black-forest-labs/FLUX___1-Kontext-dev"
-DATA_ROOT="/mnt/data/datasets/test"
+MODEL_PATH="/home/yujinxin/model/black-forest-labs/FLUX___1-Kontext-dev"
+DATA_ROOT="/home/yujinxin/dataset/test"
 OUTPUT_DIR="./outputs/flux_compression_test"
 
 echo ""
@@ -28,8 +29,8 @@ python scripts/run_flux_multi_gpu_optimized.py \
     --guidance-scale 3.5 \
     --threshold 0.97 \
     --seed 42 \
-    --gpu-memory-limit-gb 20 \
-    --gpu-memory-buffer-gb 3
+    --gpu-memory-limit-gb 90 \
+    --gpu-memory-buffer-gb 6
 
 echo ""
 echo "Test 2: Run with lossless codec compression"
@@ -49,8 +50,8 @@ python scripts/run_flux_multi_gpu_optimized.py \
     --guidance-scale 3.5 \
     --threshold 0.97 \
     --seed 42 \
-    --gpu-memory-limit-gb 20 \
-    --gpu-memory-buffer-gb 3
+    --gpu-memory-limit-gb 90 \
+    --gpu-memory-buffer-gb 6
 
 echo ""
 echo "Test 3: Run with lossy HEVC compression @ 5 Mbps"
@@ -70,8 +71,8 @@ python scripts/run_flux_multi_gpu_optimized.py \
     --guidance-scale 3.5 \
     --threshold 0.97 \
     --seed 42 \
-    --gpu-memory-limit-gb 20 \
-    --gpu-memory-buffer-gb 3
+    --gpu-memory-limit-gb 90 \
+    --gpu-memory-buffer-gb 6
 
 echo ""
 echo "=========================================="

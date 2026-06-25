@@ -4,16 +4,18 @@
 
 set -euo pipefail
 
-source .venv/bin/activate
+# Activate the conda environment (single RTX PRO 6000 setup).
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate cacheedit
 
 PYTORCH_CUDA_ALLOC_CONF_VALUE="expandable_segments:True"
-MODEL_PATH="/mnt/data/models/black-forest-labs/FLUX___1-Kontext-dev"
-DATA_ROOT="/mnt/data/datasets/test"
+MODEL_PATH="/home/yujinxin/model/black-forest-labs/FLUX___1-Kontext-dev"
+DATA_ROOT="/home/yujinxin/dataset/test"
 OUTPUT_DIR="./outputs/cache_quality_metrics_28step_full_dataset/cache_compressed_onepass"
 
-NUM_GPUS="4"
-GPU_MEMORY_LIMIT_GB="16.0"
-GPU_MEMORY_BUFFER_GB="5.0"
+NUM_GPUS="1"
+GPU_MEMORY_LIMIT_GB="90.0"
+GPU_MEMORY_BUFFER_GB="6.0"
 NUM_INFERENCE_STEPS="28"
 GUIDANCE_SCALE="3.5"
 SEED="42"

@@ -246,6 +246,22 @@ def _dispatch_transformer_blocks(pipeline, args):
     print(f"[Optimization] Transformer device map: {device_map}")
 
 
+def resolve_cache_device(args) -> torch.device:
+    """Resolve where the activation cache should live.
+
+    'auto' keeps the cache on the GPU when running on a single GPU (a large
+    card like the RTX PRO 6000 has plenty of room and this avoids the slow
+    CPU<->GPU transfers), and falls back to CPU for multi-GPU/offload setups
+    where GPU memory is tight.
+    """
+    choice = str(args.cache_device).lower()
+    if choice == "auto":
+        if torch.cuda.is_available() and args.num_gpus == 1:
+            return torch.device(args.device)
+        return torch.device("cpu")
+    return torch.device(choice)
+
+
 def build_pipeline_with_offload(args, *, enable_cache: bool = True):
     """Build pipeline with model parallelism across multiple GPUs."""
     from cache_edit.models.flux import create_default_cache_manager
@@ -262,12 +278,16 @@ def build_pipeline_with_offload(args, *, enable_cache: bool = True):
     else:
         print("[Optimization] Initializing pipeline with sequential CPU offload...")
 
-    # Use CPU for cache storage to avoid GPU OOM when handling large images
+    # Cache storage device. On a single large GPU we keep activations on the
+    # GPU to avoid CPU<->GPU transfer overhead; CPU is used only when memory is
+    # tight (multi-GPU/offload) or when explicitly requested.
+    cache_device = resolve_cache_device(args)
+    print(f"[Optimization] Activation cache device: {cache_device}")
     cache_manager = create_default_cache_manager(
         num_inference_steps=args.num_inference_steps,
         threshold=args.threshold,
         cache_interval=args.cache_interval,
-        cache_device=torch.device("cpu"),  # Store cache on CPU to save GPU memory
+        cache_device=cache_device,
         use_activation_cache=enable_cache,
         num_gpus=args.num_gpus,
         gpu_memory_limit_gb=args.gpu_memory_limit_gb,
@@ -316,10 +336,23 @@ def build_pipeline_with_offload(args, *, enable_cache: bool = True):
             f"[Optimization] Transformer blocks distributed across "
             f"{args.num_gpus} GPUs"
         )
-    else:
-        # Single GPU: use sequential CPU offload
+    elif args.cpu_offload:
+        # Small-GPU fallback: stream layers to the GPU on demand.
         print("[Optimization] Enabling sequential CPU offload (layers move to GPU on-demand)...")
         pipeline.enable_sequential_cpu_offload(gpu_id=0)
+    else:
+        # Large single GPU (e.g. RTX PRO 6000, 96GB): keep the whole pipeline
+        # resident on the GPU for maximum throughput instead of CPU offload.
+        print(f"[Optimization] Moving full pipeline to {args.device} (no offload)...")
+        pipeline.to(args.device)
+        if hasattr(pipeline.vae, "enable_slicing"):
+            pipeline.vae.enable_slicing()
+        if hasattr(pipeline.vae, "enable_tiling"):
+            pipeline.vae.enable_tiling()
+        _print_cuda_memory(
+            "[Optimization] CUDA memory after full GPU placement:",
+            args.num_gpus,
+        )
 
     # Now install cache hooks
     print("[Optimization] Installing cache hooks...")
@@ -483,10 +516,10 @@ def get_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
         "--model-path",
-        default="/mnt/data/models/black-forest-labs/FLUX___1-Kontext-dev",
+        default="/home/yujinxin/model/black-forest-labs/FLUX___1-Kontext-dev",
     )
     p.add_argument(
-        "--data-root", default="/mnt/data/datasets/test"
+        "--data-root", default="/home/yujinxin/dataset/test"
     )
     p.add_argument(
         "--metadata",
@@ -502,6 +535,21 @@ def get_args():
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--num-gpus", type=int, default=1)
+    p.add_argument(
+        "--cpu-offload",
+        action="store_true",
+        help="Single-GPU only: stream transformer layers from CPU on demand "
+        "(for small-VRAM cards). Default keeps the full pipeline resident on "
+        "the GPU, which is best for large cards like the RTX PRO 6000 (96GB).",
+    )
+    p.add_argument(
+        "--cache-device",
+        default="auto",
+        help="Where to store the activation cache: 'auto' (GPU when running on "
+        "a single GPU, CPU otherwise), 'cpu', or an explicit device like "
+        "'cuda:0'. Keeping the cache on a large single GPU (RTX PRO 6000, 96GB) "
+        "avoids the CPU<->GPU transfer overhead that makes CPU caching slow.",
+    )
     p.add_argument("--gpu-memory-limit-gb", type=float, default=22.0)
     p.add_argument("--gpu-memory-buffer-gb", type=float, default=2.0)
     p.add_argument("--true-cfg-scale", type=float, default=1.0)
