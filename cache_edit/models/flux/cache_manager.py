@@ -699,10 +699,9 @@ class FluxCacheManager(BaseCacheManager):
                 for v in value
             )
         if hasattr(value, "bitstream") and hasattr(value, "packet_sizes"):
-            return {
-                "bitstream": value.bitstream.to(device),
-                "packet_sizes": value.packet_sizes.to(device),
-            }
+            # TensorEncodeOutput: bitstream and packet_sizes must stay on CPU
+            # for NVDEC (which requires host memory input). Do not move them.
+            return value
         return value
 
     def _ensure_async_compression_executor(self) -> ThreadPoolExecutor:
