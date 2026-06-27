@@ -6,6 +6,19 @@ Compresses Flux activation tensors with NVENC/NVDEC codecs to reduce cache memor
 `hevc` and `h264` use lossy video rate control. `lossless` still uses the
 HEVC/NVENC codec, but switches the codec to lossless mode after the activation
 has been quantized into uint8 frames.
+
+## Storage Architecture
+
+Compressed bitstreams are stored on **CPU (pinned memory)** to optimize for
+NVDEC's requirement that input bitstreams reside in host memory:
+
+- **Encode**: GPU activation → NVENC → bitstream on GPU → D→H transfer (once) →
+  store on CPU
+- **Decode** (cache reuse): bitstream on CPU → NVDEC → frame on GPU
+
+This avoids redundant D→H copies on every cache reuse. A cache entry compressed
+once may be reused 10+ times across diffusion steps—storing on CPU after the
+initial encode saves 9 D→H round-trips.
 """
 
 import torch
@@ -36,10 +49,9 @@ def _move_compressed_value(value, device: torch.device):
             for v in value
         )
     if hasattr(value, "bitstream") and hasattr(value, "packet_sizes"):
-        return {
-            "bitstream": value.bitstream.to(device),
-            "packet_sizes": value.packet_sizes.to(device),
-        }
+        # TensorEncodeOutput: bitstream and packet_sizes must stay on CPU
+        # for NVDEC (which requires host memory input). Do not move them.
+        return value
     return value
 
 

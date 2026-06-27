@@ -300,17 +300,41 @@ TensorEncodeOutput TensorEncoder::encode(torch::Tensor input) {
         data_offset += frame_size;
     }
 
+    // Build packet_sizes tensor directly on GPU (avoiding CPU->GPU copy)
     auto bs_sizes_options = torch::TensorOptions()
         .dtype(torch::kInt64)
         .layout(torch::kStrided)
-        .device(torch::kCPU)
+        .device(torch::kCUDA)
         .requires_grad(false);
-    torch::Tensor bs_sizes_tensor = torch::from_blob(output_bs_sizes.data(), {num_packets}, bs_sizes_options);
-    bs_sizes_tensor = bs_sizes_tensor.to(torch::kCUDA);
+    torch::Tensor bs_sizes_tensor = torch::empty({static_cast<int64_t>(num_packets)}, bs_sizes_options);
+    // Copy the vector data to GPU tensor
+    ck(cuMemcpyHtoD(
+        (CUdeviceptr)bs_sizes_tensor.data_ptr<int64_t>(),
+        output_bs_sizes.data(),
+        num_packets * sizeof(int64_t)
+    ));
     output_bitstream.resize_({output_bitstream_offset});
 
+    // Move both bitstream and packet_sizes to CPU (pinned memory) asynchronously
+    // so they're ready for NVDEC on decode. This avoids redundant D->H copies on
+    // every cache reuse. Use pinned memory + non_blocking=true to overlap the
+    // transfer with subsequent computation.
+    torch::Tensor bitstream_cpu = torch::empty(
+        {output_bitstream.size(0)},
+        torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU).pinned_memory(true)
+    );
+    torch::Tensor bs_sizes_cpu = torch::empty(
+        {bs_sizes_tensor.size(0)},
+        torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU).pinned_memory(true)
+    );
+    // non_blocking=true: D->H transfer happens asynchronously on the current CUDA
+    // stream. PyTorch will automatically insert stream synchronization when the
+    // CPU tensor is accessed, so the caller doesn't need explicit synchronization.
+    bitstream_cpu.copy_(output_bitstream, /*non_blocking=*/true);
+    bs_sizes_cpu.copy_(bs_sizes_tensor, /*non_blocking=*/true);
+
     return TensorEncodeOutput {
-        output_bitstream,
-        bs_sizes_tensor
+        bitstream_cpu,
+        bs_sizes_cpu
     };
 }

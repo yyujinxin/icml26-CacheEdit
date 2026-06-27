@@ -45,8 +45,21 @@ void TensorDecoder::close() {
 }
 
 torch::Tensor TensorDecoder::decode(torch::Tensor bitstream, torch::Tensor packet_sizes) {
-    bitstream = bitstream.to(torch::kCPU);
-    packet_sizes = packet_sizes.to(torch::kCPU);
+    // NVDEC requires bitstream in host memory. Caller should ensure bitstream
+    // and packet_sizes are already on CPU (moved there at encode time and stored
+    // on CPU to avoid redundant D->H copies on every decode/reuse).
+    if (bitstream.device().type() != torch::kCPU) {
+        throw std::runtime_error(
+            "TensorDecoder::decode expects bitstream on CPU. "
+            "The compression cache should store bitstreams on CPU after encoding "
+            "to avoid redundant D->H transfers on every reuse."
+        );
+    }
+    if (packet_sizes.device().type() != torch::kCPU) {
+        throw std::runtime_error(
+            "TensorDecoder::decode expects packet_sizes on CPU."
+        );
+    }
 
     int64_t* packet_sizes_ptr = packet_sizes.data_ptr<int64_t>();
     uint8_t* bitstream_ptr = bitstream.data_ptr<uint8_t>();
