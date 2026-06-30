@@ -550,8 +550,16 @@ def create_default_cache_manager(
     use_compression: bool = False,
     compression_bitrate: float = 5.0,
     compression_codec: str = "lossless",
+    compression_rc_mode: str = "vbr",
+    compression_const_qp: Optional[int] = None,
+    compression_bitrate_max_multiplier: float = 10.0,
     compression_gop_length: int = 1,
     compression_frame_interval_p: int = 1,
+    compression_quant_group_size: int = 256,
+    compression_quant_outlier_ratio: float = 0.0,
+    compression_quant_error_probe_groups: Optional[List[int]] = None,
+    compression_quant_error_probe_outlier_ratios: Optional[List[float]] = None,
+    compression_quant_error_probe_max_rows: int = 0,
 ) -> FluxCacheManager:
     """
     创建一组合理默认参数的 FluxCacheManager。
@@ -570,8 +578,23 @@ def create_default_cache_manager(
         compression_bitrate: 压缩码率（Mbps），仅 hevc/h264 使用
         compression_codec: 'lossless' 使用 HEVC/NVENC lossless 编码量化帧；
             'hevc'/'h264' 为有损视频编解码器
+        compression_rc_mode: hevc/h264 的码率控制模式：vbr/cbr/constqp
+        compression_const_qp: constqp 模式的 QP；越小质量越高、压缩率越低
+        compression_bitrate_max_multiplier: vbr/cbr 模式 max bitrate 相对
+            average bitrate 的倍率
         compression_gop_length: 连续 layer 帧间压缩 GOP 长度；<=1 表示全 I 帧
         compression_frame_interval_p: P 帧间隔；1 表示 IPPP
+        compression_quant_group_size: lossless codec 之前 FP16->uint8 的
+            group-wise 量化 group size；<=0 表示强制使用 channel-wise
+            quantization
+        compression_quant_outlier_ratio: 可选异常 residual 比例；>0 时保存
+            最坏的少量量化 residual 作为辅助元数据
+        compression_quant_error_probe_groups: 可选 qg 列表；启用后在真实
+            activation 上记录不同量化方案的误差
+        compression_quant_error_probe_outlier_ratios: 可选 residual 比例列表；
+            与 probe qg 列表组合估计
+        compression_quant_error_probe_max_rows: 每个 activation 参与误差
+            估计的最大 row 数；<=0 表示全量
     """
     if cache_device is None:
         cache_device = torch.device(
@@ -590,6 +613,16 @@ def create_default_cache_manager(
         use_compression=use_compression,
         compression_bitrate=compression_bitrate,
         compression_codec=compression_codec,
+        compression_rc_mode=compression_rc_mode,
+        compression_const_qp=compression_const_qp,
+        compression_bitrate_max_multiplier=compression_bitrate_max_multiplier,
         compression_gop_length=compression_gop_length,
         compression_frame_interval_p=compression_frame_interval_p,
+        compression_quant_group_size=compression_quant_group_size,
+        compression_quant_outlier_ratio=compression_quant_outlier_ratio,
+        compression_quant_error_probe_groups=compression_quant_error_probe_groups,
+        compression_quant_error_probe_outlier_ratios=(
+            compression_quant_error_probe_outlier_ratios
+        ),
+        compression_quant_error_probe_max_rows=compression_quant_error_probe_max_rows,
     )

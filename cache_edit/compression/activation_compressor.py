@@ -55,6 +55,30 @@ def _move_compressed_value(value, device: torch.device):
     return value
 
 
+def _slice_outliers_for_frame(
+    data_dict: Dict[str, Any],
+    frame_index: int,
+    rows_per_frame: int,
+    group_size: int,
+) -> Dict[str, Any]:
+    indices = data_dict.get("outlier_indices")
+    residuals = data_dict.get("outlier_residuals")
+    if not (
+        isinstance(indices, torch.Tensor)
+        and isinstance(residuals, torch.Tensor)
+        and indices.numel() > 0
+        and residuals.numel() > 0
+    ):
+        return data_dict
+
+    flat_start = int(frame_index) * int(rows_per_frame) * int(group_size)
+    flat_end = flat_start + int(rows_per_frame) * int(group_size)
+    mask = (indices >= flat_start) & (indices < flat_end)
+    data_dict["outlier_indices"] = (indices[mask] - flat_start).to(torch.int32)
+    data_dict["outlier_residuals"] = residuals[mask]
+    return data_dict
+
+
 try:
     from .ops import (
         CodecType, RateControlMode, PresetType, TuningInfo, InputFormat,
@@ -64,6 +88,7 @@ try:
         Pipeline,
         CWQuantization,
         GWQuantization,
+        GWOutlierQuantization,
         FixedTiling,
         MonoNVEncode,
         MonoNVEncodeSequence,
@@ -77,25 +102,69 @@ except ImportError as e:
     Pipeline = object
     CWQuantization = object
     GWQuantization = object
+    GWOutlierQuantization = object
     FixedTiling = object
     MonoNVEncode = object
     MonoNVEncodeSequence = object
 
 
-LOSSLESS_QUANT_GROUP_SIZE = 64
+DEFAULT_LOSSLESS_QUANT_GROUP_SIZE = 256
 
 
-def _make_quantization_step(codec: str, width: int):
+def _normalize_quant_group_size(group_size: Optional[int]) -> Optional[int]:
+    if group_size is None:
+        return None
+    group_size = int(group_size)
+    if group_size <= 0:
+        return None
+    return group_size
+
+
+def _normalize_quant_outlier_ratio(outlier_ratio: Optional[float]) -> float:
+    if outlier_ratio is None:
+        return 0.0
+    return max(0.0, float(outlier_ratio))
+
+
+def _make_quantization_step(
+    codec: str,
+    width: int,
+    quant_group_size: Optional[int] = DEFAULT_LOSSLESS_QUANT_GROUP_SIZE,
+    quant_outlier_ratio: float = 0.0,
+):
     """Choose the quantizer paired with the codec path."""
-    if str(codec).lower() == "lossless" and width % LOSSLESS_QUANT_GROUP_SIZE == 0:
-        return GWQuantization(groupsize=LOSSLESS_QUANT_GROUP_SIZE)
+    group_size = _normalize_quant_group_size(quant_group_size)
+    if group_size and width % group_size == 0:
+        outlier_ratio = _normalize_quant_outlier_ratio(quant_outlier_ratio)
+        if outlier_ratio > 0.0:
+            return GWOutlierQuantization(
+                groupsize=group_size,
+                outlier_ratio=outlier_ratio,
+            )
+        return GWQuantization(groupsize=group_size)
     return CWQuantization()
 
 
-def _quantization_name(codec: str, width: int) -> str:
-    if str(codec).lower() == "lossless" and width % LOSSLESS_QUANT_GROUP_SIZE == 0:
-        return f"gw{LOSSLESS_QUANT_GROUP_SIZE}"
+def _quantization_name(
+    codec: str,
+    width: int,
+    quant_group_size: Optional[int] = DEFAULT_LOSSLESS_QUANT_GROUP_SIZE,
+    quant_outlier_ratio: float = 0.0,
+) -> str:
+    group_size = _normalize_quant_group_size(quant_group_size)
+    if group_size and width % group_size == 0:
+        if _normalize_quant_outlier_ratio(quant_outlier_ratio) > 0.0:
+            return f"gwo{group_size}"
+        return f"gw{group_size}"
     return "cw"
+
+
+def _quantization_variant(quantization: str) -> str:
+    if str(quantization).startswith("gwo"):
+        return "group_round_zero_point_outlier"
+    if str(quantization).startswith("gw"):
+        return "group_round_zero_point"
+    return "channel_min_offset"
 
 
 def _quantization_rows_per_frame(
@@ -103,8 +172,19 @@ def _quantization_rows_per_frame(
     height: int,
     width: int,
 ) -> int:
-    if str(quantization or "").startswith("gw"):
-        return int(height * width // LOSSLESS_QUANT_GROUP_SIZE)
+    quantization = str(quantization or "")
+    if quantization.startswith("gwo"):
+        prefix_len = 3
+    elif quantization.startswith("gw"):
+        prefix_len = 2
+    else:
+        prefix_len = 0
+    if prefix_len:
+        try:
+            group_size = int(quantization[prefix_len:])
+        except ValueError:
+            group_size = DEFAULT_LOSSLESS_QUANT_GROUP_SIZE
+        return int(height * width // group_size)
     return int(height)
 
 
@@ -123,6 +203,10 @@ class ActivationCompressor:
         tile_width: int = 2048,
         bitrate_max_multiplier: float = 10.0,
         max_cached_pipelines: int = 2,
+        quant_group_size: Optional[int] = DEFAULT_LOSSLESS_QUANT_GROUP_SIZE,
+        quant_outlier_ratio: float = 0.0,
+        rc_mode: str = "vbr",
+        const_qp: Optional[int] = None,
     ):
         """
         Args:
@@ -133,6 +217,12 @@ class ActivationCompressor:
             tile_width: Width of video tiles
             bitrate_max_multiplier: Max bitrate as multiple of average
             max_cached_pipelines: Maximum number of pipelines to cache (to limit NVENC resources)
+            quant_group_size: Group size for lossless codec uint8 activation
+                quantization. Use <=0 to force channel-wise quantization.
+            quant_outlier_ratio: Optional fraction of the worst quantization
+                residuals to store exactly beside the codec payload.
+            rc_mode: Rate-control mode for hevc/h264: vbr, cbr, or constqp.
+            const_qp: Constant QP value used when rc_mode=constqp.
         """
         codec = str(codec).lower()
         if not NVENC_AVAILABLE:
@@ -144,6 +234,15 @@ class ActivationCompressor:
         self.tile_width = tile_width
         self.bitrate_max_multiplier = bitrate_max_multiplier
         self.max_cached_pipelines = max_cached_pipelines
+        self.quant_group_size = _normalize_quant_group_size(quant_group_size)
+        self.quant_outlier_ratio = _normalize_quant_outlier_ratio(
+            quant_outlier_ratio
+        )
+        self.rc_mode = str(rc_mode or "vbr").lower()
+        if self.rc_mode == "constqp":
+            self.const_qp = 28 if const_qp is None else int(const_qp)
+        else:
+            self.const_qp = None if const_qp is None else int(const_qp)
 
         # Cache pipelines per GPU: {gpu_id: {shape_key: pipeline}}
         self._pipeline_cache_per_gpu = {}
@@ -151,7 +250,13 @@ class ActivationCompressor:
         self._sequence_pipeline_cache_per_gpu = {}
         self._sequence_pipeline_access_order_per_gpu = {}
 
-        logger.info(f"[ActivationCompressor] Initialized: bitrate={bitrate}Mbps, codec={codec}, max_pipelines={max_cached_pipelines} per GPU")
+        logger.info(
+            f"[ActivationCompressor] Initialized: bitrate={bitrate}Mbps, "
+            f"codec={codec}, quant_group_size={self.quant_group_size}, "
+            f"quant_outlier_ratio={self.quant_outlier_ratio}, "
+            f"rc_mode={self.rc_mode}, const_qp={self.const_qp}, "
+            f"max_pipelines={max_cached_pipelines} per GPU"
+        )
 
     def clear_pipeline_cache(self) -> None:
         """Drop cached pipeline objects so native NVENC resources can be freed."""
@@ -181,9 +286,25 @@ class ActivationCompressor:
             config.preset = PresetType.P1
             config.tuning_info = TuningInfo.Lossless
         else:
-            config.average_bit_rate = int(self.bitrate * 1000000)
-            config.max_bit_rate = int(self.bitrate * 1000000 * self.bitrate_max_multiplier)
-            config.rc_mode = RateControlMode.VBR
+            if self.rc_mode == "constqp":
+                qp = EncodeQp()
+                qp.qpInterP = int(self.const_qp if self.const_qp is not None else 28)
+                qp.qpInterB = int(self.const_qp if self.const_qp is not None else 28)
+                qp.qpIntra = int(self.const_qp if self.const_qp is not None else 28)
+                config.rc_mode = RateControlMode.ConstQP
+                config.const_qp = qp
+            elif self.rc_mode == "cbr":
+                config.average_bit_rate = int(self.bitrate * 1000000)
+                config.max_bit_rate = int(
+                    self.bitrate * 1000000 * self.bitrate_max_multiplier
+                )
+                config.rc_mode = RateControlMode.CBR
+            else:
+                config.average_bit_rate = int(self.bitrate * 1000000)
+                config.max_bit_rate = int(
+                    self.bitrate * 1000000 * self.bitrate_max_multiplier
+                )
+                config.rc_mode = RateControlMode.VBR
             config.preset = PresetType.P7
             config.tuning_info = TuningInfo.HighQuality
         config.monochrome = True
@@ -218,7 +339,12 @@ class ActivationCompressor:
 
         pipeline = Pipeline([
             AddShape(),  # Add shape key for FixedTiling
-            _make_quantization_step(self.codec, width),  # FP16 -> uint8 quantization
+            _make_quantization_step(
+                self.codec,
+                width,
+                self.quant_group_size,
+                self.quant_outlier_ratio,
+            ),  # FP16 -> uint8 quantization
             FixedTiling(
                 pad_to_shape=[padded_height, padded_width],
                 resize_to_shape=[1, 1, padded_height, padded_width],
@@ -260,7 +386,12 @@ class ActivationCompressor:
 
         return Pipeline([
             AddShape(),
-            _make_quantization_step(self.codec, width),
+            _make_quantization_step(
+                self.codec,
+                width,
+                self.quant_group_size,
+                self.quant_outlier_ratio,
+            ),
             FixedTiling(
                 pad_to_shape=[frame_count, padded_height, padded_width],
                 resize_to_shape=[frame_count, 1, padded_height, padded_width],
@@ -273,7 +404,7 @@ class ActivationCompressor:
         """Get or create cached pipeline for shape and device with LRU eviction."""
         # Get GPU ID from device
         gpu_id = device.index if device.type == 'cuda' and device.index is not None else 0
-        shape_key = (height, width)
+        shape_key = (height, width, self.quant_outlier_ratio)
 
         # Initialize cache for this GPU if needed
         if gpu_id not in self._pipeline_cache_per_gpu:
@@ -318,7 +449,14 @@ class ActivationCompressor:
     ) -> Pipeline:
         gpu_id = device.index if device.type == 'cuda' and device.index is not None else 0
         effective_gop = min(int(gop_length or frame_count), frame_count)
-        shape_key = (height, width, frame_count, effective_gop, int(frame_interval_p or 1))
+        shape_key = (
+            height,
+            width,
+            frame_count,
+            effective_gop,
+            int(frame_interval_p or 1),
+            self.quant_outlier_ratio,
+        )
 
         if gpu_id not in self._sequence_pipeline_cache_per_gpu:
             self._sequence_pipeline_cache_per_gpu[gpu_id] = {}
@@ -425,7 +563,17 @@ class ActivationCompressor:
             compressed_dict['original_device'] = original_device
             compressed_dict['compression_mode'] = 'intra_layer'
             compressed_dict['codec'] = self.codec
-            compressed_dict['quantization'] = _quantization_name(self.codec, width)
+            compressed_dict['quantization'] = _quantization_name(
+                self.codec,
+                width,
+                self.quant_group_size,
+                self.quant_outlier_ratio,
+            )
+            compressed_dict['quantization_variant'] = _quantization_variant(
+                compressed_dict['quantization']
+            )
+            compressed_dict['quant_group_size'] = self.quant_group_size
+            compressed_dict['quant_outlier_ratio'] = self.quant_outlier_ratio
 
             logger.debug(
                 f"[Compress] {name}: {original_shape} -> {compressed_dict['code_size']/1024/1024:.2f}MB "
@@ -513,7 +661,17 @@ class ActivationCompressor:
             effective_gop = min(int(gop_length or len(activations)), len(activations))
             compressed_dict["compression_mode"] = "inter_layer_gop"
             compressed_dict["codec"] = self.codec
-            compressed_dict["quantization"] = _quantization_name(self.codec, width)
+            compressed_dict["quantization"] = _quantization_name(
+                self.codec,
+                width,
+                self.quant_group_size,
+                self.quant_outlier_ratio,
+            )
+            compressed_dict["quantization_variant"] = _quantization_variant(
+                compressed_dict["quantization"]
+            )
+            compressed_dict["quant_group_size"] = self.quant_group_size
+            compressed_dict["quant_outlier_ratio"] = self.quant_outlier_ratio
             compressed_dict["original_shapes"] = original_shapes
             compressed_dict["original_dtypes"] = original_dtypes
             compressed_dict["original_devices"] = original_devices
@@ -576,7 +734,14 @@ class ActivationDecompressor:
     def _codec_type(codec: str):
         return CodecType.H264 if str(codec).lower() == "h264" else CodecType.HEVC
 
-    def _create_pipeline(self, height: int, width: int, codec: str = "hevc") -> Pipeline:
+    def _create_pipeline(
+        self,
+        height: int,
+        width: int,
+        codec: str = "hevc",
+        quant_group_size: Optional[int] = DEFAULT_LOSSLESS_QUANT_GROUP_SIZE,
+        quant_outlier_ratio: float = 0.0,
+    ) -> Pipeline:
         """Create decompression pipeline (reuses compression pipeline)."""
         # Calculate padded dimensions that are divisible by tile size
         padded_height = ((height + self.tile_height - 1) // self.tile_height) * self.tile_height
@@ -606,7 +771,12 @@ class ActivationDecompressor:
 
         pipeline = Pipeline([
             AddShape(),
-            _make_quantization_step(codec, width),
+            _make_quantization_step(
+                codec,
+                width,
+                quant_group_size,
+                quant_outlier_ratio,
+            ),
             FixedTiling(
                 pad_to_shape=[padded_height, padded_width],
                 resize_to_shape=[1, 1, padded_height, padded_width],
@@ -623,6 +793,8 @@ class ActivationDecompressor:
         width: int,
         frame_count: int,
         codec: str = "hevc",
+        quant_group_size: Optional[int] = DEFAULT_LOSSLESS_QUANT_GROUP_SIZE,
+        quant_outlier_ratio: float = 0.0,
     ) -> Pipeline:
         padded_height = ((height + self.tile_height - 1) // self.tile_height) * self.tile_height
         padded_width = ((width + self.tile_width - 1) // self.tile_width) * self.tile_width
@@ -650,7 +822,12 @@ class ActivationDecompressor:
 
         return Pipeline([
             AddShape(),
-            _make_quantization_step(codec, width),
+            _make_quantization_step(
+                codec,
+                width,
+                quant_group_size,
+                quant_outlier_ratio,
+            ),
             FixedTiling(
                 pad_to_shape=[frame_count, padded_height, padded_width],
                 resize_to_shape=[frame_count, 1, padded_height, padded_width],
@@ -665,11 +842,23 @@ class ActivationDecompressor:
         width: int,
         device: torch.device,
         codec: str = "hevc",
+        quant_group_size: Optional[int] = DEFAULT_LOSSLESS_QUANT_GROUP_SIZE,
+        quant_outlier_ratio: float = 0.0,
     ) -> Pipeline:
         """Get or create cached pipeline for shape and device with LRU eviction."""
         # Get GPU ID from device
         gpu_id = device.index if device.type == 'cuda' and device.index is not None else 0
-        shape_key = (height, width, str(codec).lower())
+        shape_key = (
+            height,
+            width,
+            str(codec).lower(),
+            _quantization_name(
+                codec,
+                width,
+                quant_group_size,
+                quant_outlier_ratio,
+            ),
+        )
 
         # Initialize cache for this GPU if needed
         if gpu_id not in self._pipeline_cache_per_gpu:
@@ -697,7 +886,13 @@ class ActivationDecompressor:
 
         # Create new pipeline on the correct GPU
         logger.info(f"[ActivationDecompressor] Creating pipeline for GPU {gpu_id}, shape ({height}, {width})")
-        pipeline = self._create_pipeline(height, width, codec=codec)
+        pipeline = self._create_pipeline(
+            height,
+            width,
+            codec=codec,
+            quant_group_size=quant_group_size,
+            quant_outlier_ratio=quant_outlier_ratio,
+        )
         pipeline_cache[shape_key] = pipeline
         access_order.append(shape_key)
 
@@ -710,9 +905,22 @@ class ActivationDecompressor:
         frame_count: int,
         device: torch.device,
         codec: str = "hevc",
+        quant_group_size: Optional[int] = DEFAULT_LOSSLESS_QUANT_GROUP_SIZE,
+        quant_outlier_ratio: float = 0.0,
     ) -> Pipeline:
         gpu_id = device.index if device.type == 'cuda' and device.index is not None else 0
-        shape_key = (height, width, frame_count, str(codec).lower())
+        shape_key = (
+            height,
+            width,
+            frame_count,
+            str(codec).lower(),
+            _quantization_name(
+                codec,
+                width,
+                quant_group_size,
+                quant_outlier_ratio,
+            ),
+        )
 
         if gpu_id not in self._sequence_pipeline_cache_per_gpu:
             self._sequence_pipeline_cache_per_gpu[gpu_id] = {}
@@ -744,6 +952,8 @@ class ActivationDecompressor:
             width,
             frame_count,
             codec=codec,
+            quant_group_size=quant_group_size,
+            quant_outlier_ratio=quant_outlier_ratio,
         )
         pipeline_cache[shape_key] = pipeline
         access_order.append(shape_key)
@@ -805,6 +1015,12 @@ class ActivationDecompressor:
                     width,
                     target_device,
                     codec=compressed_dict.get("codec", "hevc"),
+                    quant_group_size=compressed_dict.get(
+                        "quant_group_size", DEFAULT_LOSSLESS_QUANT_GROUP_SIZE
+                    ),
+                    quant_outlier_ratio=compressed_dict.get(
+                        "quant_outlier_ratio", 0.0
+                    ),
                 )
 
                 # We'll manually handle the backward pass step by step
@@ -913,12 +1129,24 @@ class ActivationDecompressor:
                     frame_count,
                     decode_device,
                     codec=compressed_dict.get("codec", "hevc"),
+                    quant_group_size=compressed_dict.get(
+                        "quant_group_size", DEFAULT_LOSSLESS_QUANT_GROUP_SIZE
+                    ),
+                    quant_outlier_ratio=compressed_dict.get(
+                        "quant_outlier_ratio", 0.0
+                    ),
                 )
                 single_pipeline = self._get_pipeline(
                     height,
                     width,
                     decode_device,
                     codec=compressed_dict.get("codec", "hevc"),
+                    quant_group_size=compressed_dict.get(
+                        "quant_group_size", DEFAULT_LOSSLESS_QUANT_GROUP_SIZE
+                    ),
+                    quant_outlier_ratio=compressed_dict.get(
+                        "quant_outlier_ratio", 0.0
+                    ),
                 )
 
                 data_dict = compressed_dict.copy()
@@ -966,6 +1194,19 @@ class ActivationDecompressor:
                     row_end = row_start + rows_per_frame
                     frame_dict["scale"] = scale[row_start:row_end]
                     frame_dict["offset"] = offset[row_start:row_end]
+                    group_size = int(
+                        compressed_dict.get(
+                            "quant_group_size",
+                            DEFAULT_LOSSLESS_QUANT_GROUP_SIZE,
+                        )
+                        or DEFAULT_LOSSLESS_QUANT_GROUP_SIZE
+                    )
+                    frame_dict = _slice_outliers_for_frame(
+                        frame_dict,
+                        frame_index,
+                        rows_per_frame,
+                        group_size,
+                    )
 
                     frame_dict["shape"] = torch.Size([height, width])
                     frame_dict = single_pipeline.steps[-3].backward(frame_dict)

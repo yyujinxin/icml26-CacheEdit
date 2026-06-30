@@ -19,14 +19,16 @@ compression and quality-evaluation work.
 
 ## Current Stable Setup
 
-The current stable FLUX configuration is:
+The current qg256 GOP/P-frame exploration starts from:
 
 ```text
 num_inference_steps = 28
 cache_interval = 5
 compression_codec = lossless
-compression_gop_length = 16
-compression_frame_interval_p = 16
+compression_gop_length = 32
+compression_frame_interval_p = 1
+compression_quant_group_size = 256
+compression_quant_outlier_ratio = 0.0
 ```
 
 Important constraints:
@@ -37,8 +39,20 @@ Important constraints:
 - `lossless` still uses HEVC/NVENC codec. It does not bypass codec storage.
   FP16 activations are quantized to uint8 frames first; the codec then encodes
   those frames in lossless mode.
+- `compression_quant_group_size` controls the group-wise FP16-to-uint8
+  quantizer used before codec encoding. Smaller groups usually improve
+  activation fidelity but increase scale/offset metadata; larger groups can
+  improve total compression ratio at higher quantization error.
+- `compression_quant_outlier_ratio` optionally stores a tiny fraction of the
+  largest quantization residuals as side metadata. The main activation still
+  goes through the uint8 codec path; `0` preserves the current qg behavior.
 - P frames are supported. The native decoder handles flush calls that return
   multiple frames, so GOP/P-frame activation recovery remains aligned.
+- GOP/P-frame settings are still being swept with qg256. Use
+  `scripts/sweep_gop_params_qg256.sh` to pick the best setting for the target
+  round count instead of assuming one setting is always optimal. In the current
+  28-step, 2-round probe, `gop32,p1,qg256` gave the best compression ratio while
+  still passing the strict cache-vs-compressed quality gate.
 
 ## Environment
 
@@ -126,6 +140,64 @@ This compares:
 
 It then evaluates generated images with PSNR, SSIM, and LPIPS.
 
+Sweep compression quantization/GOP settings:
+
+```bash
+bash scripts/sweep_compression_quant_params.sh
+```
+
+This runs no-cache and cache-only references once, then evaluates each
+configured cache+compression setting. It writes `sweep_summary.csv`,
+`sweep_summary.json`, and `recommended_config.json`; the last file contains both
+the quality-first setting and the best compression-ratio setting that passes the
+configured quality gate.
+
+Sweep only GOP/P-frame settings while keeping qg256 fixed:
+
+```bash
+bash scripts/sweep_gop_params_qg256.sh
+```
+
+This is the preferred script for the current GOP search. It defaults to a
+2-round coarse sweep: round 0 builds/compresses cache, and round 1 decodes and
+reuses it. It reports PSNR, SSIM, LPIPS, compression ratio, and torch CUDA peak
+memory for each candidate. Validate the selected candidate later with the target
+round count.
+
+Probe quantization error on real activations while keeping the actual run on
+qg256:
+
+```bash
+bash scripts/probe_quant_error_qg256.sh
+```
+
+This writes `quant_error_summary.csv` and `quant_error_summary.json` next to the
+run report. It compares candidate qg values on the same activation tensors
+without changing the actual compression setting.
+
+Sweep residual-outlier ratios while keeping `qg256,gop32,p1` fixed:
+
+```bash
+bash scripts/sweep_quant_outlier_qg256.sh
+```
+
+The activation-level probe found that storing `0.1%` of the worst residuals
+cuts qg256 max activation error from roughly `110` to `25` with metadata ratio
+rising from `0.098%` to `0.117%` of original activation bytes. This needs
+image-level validation before becoming the default.
+
+Sweep lossy HEVC bitrate while keeping qg256 and the selected GOP/P setting:
+
+```bash
+bash scripts/sweep_bitrate_qg256.sh
+```
+
+The current 28-step, 2-round probe uses `qg256,gop32,p1`. In that run, the
+lossless codec anchor was the only setting that passed the strict quality gate
+(`PSNR>=41`, `SSIM>=0.994`, `LPIPS<=0.004` against cache-only). HEVC bitrates
+from `0.5` to `10.0` Mbps improved compression ratio but caused much larger
+image drift; 5 Mbps also produced an invalid-value warning in image postprocess.
+
 Run cache + compression over the full dataset with resume support:
 
 ```bash
@@ -158,8 +230,10 @@ python scripts/run_flux_multi_gpu_optimized.py \
     --use-cache-compression \
     --compression-codec lossless \
     --compression-bitrate 5.0 \
-    --compression-gop-length 16 \
-    --compression-frame-interval-p 16
+    --compression-gop-length 32 \
+    --compression-frame-interval-p 1 \
+    --compression-quant-group-size 256 \
+    --compression-quant-outlier-ratio 0.0
 ```
 
 `--compression-bitrate` is ignored by `lossless`; it is only meaningful for
@@ -179,15 +253,50 @@ When cache compression is enabled, `timings.json` includes a
 - `success_count` / `failure_count`;
 - `success_count_by_mode`;
 - `success_count_by_quantization`;
+- `quant_group_size`;
 - `payload_compression_ratio`;
 - `total_compression_ratio`;
 - `decompression_failure_count`;
 - `gop_decode_cache_hit_count`;
 - `gop_decode_cache_miss_count`.
 
+Every `timings.json` also includes `cuda_memory`, with per-GPU
+`peak_allocated_gib` and `peak_reserved_gib` measured by `torch.cuda` after the
+pipeline is initialized. This is useful for comparing GOP settings under the
+same model placement.
+
+When `--compression-quant-error-probe-groups` is set, `compression.summary`
+also includes `quant_error_probe_by_quantization`. This reports activation-level
+RMSE, MAE, relative RMSE, max error, and scale/offset metadata overhead for each
+candidate qg.
+
 `payload_compression_ratio` counts codec bitstream bytes only.
 `total_compression_ratio` also includes quantization metadata and packet-size
 metadata, so it better reflects real cache memory use.
+
+The current 28-step, 3-round probe on `image_idx=0000` found two useful qg points
+among tested `64/128/256/512/0`:
+
+- `compression_quant_group_size=128` is the quality-first setting and gave the
+  strongest compressed-vs-cache quality.
+- `compression_quant_group_size=256` is the current optimized default and the
+  best ratio under the default
+  quality gate used by `scripts/summarize_compression_sweep.py`
+  (`PSNR>=41`, `SSIM>=0.994`, `LPIPS<=0.004`, no compression failures), raising
+  total compression ratio from `2.75x` to `3.19x`.
+
+`512` is useful when prioritizing compression ratio more aggressively; `0`
+forces channel-wise quantization and compressed much more aggressively in the
+probe, but with visibly larger metric loss.
+
+The group-wise quantizer uses a rounded zero-point restore path. A min-offset
+group-wise variant was tested because it slightly reduced synthetic activation
+error, but the real 28-step probe produced worse image metrics, so it is not the
+current default.
+
+For longer edit chains, quality drift can accumulate. A 5-round probe did not
+pass the earlier strict 3-round quality gate, so GOP/P-frame selection should be
+validated at the same round count that will be used in the target experiment.
 
 ## How Cache Compression Works
 
@@ -196,7 +305,9 @@ within the same diffusion step:
 
 1. FP16 activation is reshaped to `[tokens, hidden]`.
 2. It is quantized to uint8 frames. In `lossless` mode the preferred quantizer
-   is `GWQuantization(groupsize=64)`.
+   is `GWQuantization(groupsize=<compression_quant_group_size>)`; the default
+   is 256. Group-wise quantization uses rounded zero-points; channel-wise
+   fallback uses min-offset restore.
 3. `FixedTiling` pads and tiles the frame into NVENC-compatible chunks.
 4. `MonoNVEncodeSequence` encodes the layer sequence as HEVC/H.264 video.
 5. The compressed payload and quantization metadata are stored in cache entries.
@@ -220,6 +331,11 @@ data flow and troubleshooting notes.
 - `cache_edit/compression/pipeline/nvenc.py`: Python codec pipeline wrappers.
 - `cache_edit/compression/csrc/`: native NVENC/NVDEC extension.
 - `scripts/evaluate_image_metrics.py`: PSNR / SSIM / LPIPS evaluation.
+- `scripts/sweep_compression_quant_params.sh`: parameter sweep for GOP and
+  quantization group size.
+- `scripts/sweep_gop_params_qg256.sh`: GOP/P-frame sweep with qg256 fixed.
+- `scripts/probe_quant_error_qg256.sh`: real-activation quantization error
+  probe for qg candidates.
 
 ## Profiling And Optimization Notes
 
@@ -254,7 +370,10 @@ bash -n \
     scripts/test_gop28_full.sh \
     scripts/test_no_cache_28_full.sh \
     scripts/test_cache_quality_metrics.sh \
-    scripts/run_cache_compressed_full_dataset_resume.sh
+    scripts/run_cache_compressed_full_dataset_resume.sh \
+    scripts/sweep_compression_quant_params.sh \
+    scripts/sweep_gop_params_qg256.sh \
+    scripts/probe_quant_error_qg256.sh
 ```
 
 GPU/NVENC validation requires running on a machine with visible NVIDIA GPUs.

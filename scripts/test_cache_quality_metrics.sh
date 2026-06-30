@@ -68,6 +68,12 @@ COMPRESSION_GOP_LENGTH="16"
 # P-frame interval inside the NVENC GOP.
 COMPRESSION_FRAME_INTERVAL_P="16"
 
+# Group size for lossless FP16->uint8 activation quantization before codec.
+# Smaller values usually improve precision but increase scale/offset metadata;
+# larger values may improve total compression ratio but can lose more precision.
+# Use 0 to force channel-wise quantization.
+COMPRESSION_QUANT_GROUP_SIZE="256"
+
 # Set to 1 to skip LPIPS even if the optional lpips package is installed.
 SKIP_LPIPS="0"
 
@@ -99,9 +105,9 @@ echo "Output root: ${OUTPUT_ROOT}"
 echo "Image idx: ${IMAGE_IDX}, rounds: ${MAX_ROUNDS}, steps: ${NUM_INFERENCE_STEPS}"
 echo "Cache interval: ${CACHE_INTERVAL}, threshold: ${THRESHOLD}"
 if [[ "${COMPRESSION_CODEC}" == "lossless" ]]; then
-    echo "Compression: ${COMPRESSION_CODEC} codec (bitrate ignored), GOP=${COMPRESSION_GOP_LENGTH}, P=${COMPRESSION_FRAME_INTERVAL_P}"
+    echo "Compression: ${COMPRESSION_CODEC} codec (bitrate ignored), GOP=${COMPRESSION_GOP_LENGTH}, P=${COMPRESSION_FRAME_INTERVAL_P}, QG=${COMPRESSION_QUANT_GROUP_SIZE}"
 else
-    echo "Compression: ${COMPRESSION_CODEC} ${COMPRESSION_BITRATE}Mbps, GOP=${COMPRESSION_GOP_LENGTH}, P=${COMPRESSION_FRAME_INTERVAL_P}"
+    echo "Compression: ${COMPRESSION_CODEC} ${COMPRESSION_BITRATE}Mbps, GOP=${COMPRESSION_GOP_LENGTH}, P=${COMPRESSION_FRAME_INTERVAL_P}, QG=${COMPRESSION_QUANT_GROUP_SIZE}"
 fi
 echo ""
 
@@ -131,7 +137,8 @@ python scripts/run_flux_multi_gpu_optimized.py \
     --compression-bitrate "${COMPRESSION_BITRATE}" \
     --compression-codec "${COMPRESSION_CODEC}" \
     --compression-gop-length "${COMPRESSION_GOP_LENGTH}" \
-    --compression-frame-interval-p "${COMPRESSION_FRAME_INTERVAL_P}"
+    --compression-frame-interval-p "${COMPRESSION_FRAME_INTERVAL_P}" \
+    --compression-quant-group-size "${COMPRESSION_QUANT_GROUP_SIZE}"
 
 echo ""
 echo "[4/4] Evaluating image metrics..."
