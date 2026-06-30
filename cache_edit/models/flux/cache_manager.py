@@ -103,11 +103,11 @@ class FluxCacheManager(BaseCacheManager):
         self._async_compression_order: List[int] = []
         self._async_compression_installed: Set[int] = set()
         self._async_compression_next_job_id = 0
-        # NVENC/NVDEC calls are not safe to run from Python worker threads while
-        # transformer CUDA kernels are active. Keep GOP compression synchronous
-        # for correctness; decoded GOP frames are still cached to avoid repeated
-        # decode work within a layer group.
-        self._async_compression_max_pending = 0
+        # Enable async GOP compression to overlap encode/decode with transformer
+        # computation. Max pending = 8 allows multiple GOP compressions to queue,
+        # essential when using large GOP (e.g. GOP=32) where each compression
+        # takes longer than transformer computation for a few layers.
+        self._async_compression_max_pending = 8
         self._async_compression_wait_time_s = 0.0
         self._async_compression_wait_count = 0
         self._async_compression_submit_count = 0

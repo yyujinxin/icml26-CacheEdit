@@ -575,6 +575,11 @@ def get_args():
                    help="Inter-layer GOP length for activation compression; <=1 keeps all-I frames")
     p.add_argument("--compression-frame-interval-p", type=int, default=1,
                    help="P-frame interval for inter-layer GOP compression (1 = IPPP)")
+    p.add_argument("--compression-const-qp", type=int, default=None,
+                   help="Constant QP value for HEVC/H264 ConstQP mode (0=lossless, 4=recommended lossy). "
+                        "If set, overrides codec='lossless' and uses HEVC ConstQP. "
+                        "Higher QP = higher compression ratio but lower quality. "
+                        "Recommended: 0 (lossless), 4 (11x ratio, PSNR~32), 8 (16x ratio, PSNR~29)")
     p.add_argument(
         "--resume-skip-complete",
         action="store_true",
