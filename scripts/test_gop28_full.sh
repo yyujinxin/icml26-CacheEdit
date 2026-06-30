@@ -63,6 +63,12 @@ COMPRESSION_GOP_LENGTH="16"
 # P-frame interval inside the NVENC GOP.
 COMPRESSION_FRAME_INTERVAL_P="16"
 
+# Group size for lossless FP16->uint8 activation quantization before codec.
+# Smaller values usually improve precision but increase scale/offset metadata;
+# larger values may improve total compression ratio but can lose more precision.
+# Use 0 to force channel-wise quantization.
+COMPRESSION_QUANT_GROUP_SIZE="256"
+
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF_VALUE}"
 
 echo "=========================================="
@@ -80,6 +86,7 @@ else
     echo "  - Compression: ${COMPRESSION_CODEC} ${COMPRESSION_BITRATE}Mbps"
 fi
 echo "  - Inter-layer GOP: length=${COMPRESSION_GOP_LENGTH}, frame_interval_p=${COMPRESSION_FRAME_INTERVAL_P}"
+echo "  - Quantization: group_size=${COMPRESSION_QUANT_GROUP_SIZE}"
 echo "  - GPUs: ${NUM_GPUS}, memory limit=${GPU_MEMORY_LIMIT_GB}GB, buffer=${GPU_MEMORY_BUFFER_GB}GB"
 echo ""
 
@@ -97,6 +104,7 @@ python scripts/run_flux_multi_gpu_optimized.py \
     --compression-codec "${COMPRESSION_CODEC}" \
     --compression-gop-length "${COMPRESSION_GOP_LENGTH}" \
     --compression-frame-interval-p "${COMPRESSION_FRAME_INTERVAL_P}" \
+    --compression-quant-group-size "${COMPRESSION_QUANT_GROUP_SIZE}" \
     --num-inference-steps "${NUM_INFERENCE_STEPS}" \
     --cache-interval "${CACHE_INTERVAL}" \
     --guidance-scale "${GUIDANCE_SCALE}" \

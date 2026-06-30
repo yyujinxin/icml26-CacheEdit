@@ -43,6 +43,30 @@ def extract_instructions(row: dict):
     return [p for _, p in items]
 
 
+def parse_int_list(value: str):
+    if value is None:
+        return []
+    items = []
+    for item in str(value).split(","):
+        item = item.strip()
+        if not item:
+            continue
+        items.append(int(item))
+    return items
+
+
+def parse_float_list(value: str):
+    if value is None:
+        return []
+    items = []
+    for item in str(value).split(","):
+        item = item.strip()
+        if not item:
+            continue
+        items.append(float(item))
+    return items
+
+
 def expected_generation_paths(output_dir: str, key: str, prompts):
     gen_dir = Path(output_dir) / "generation"
     return [
@@ -55,6 +79,29 @@ def image_outputs_complete(output_dir: str, key: str, prompts) -> bool:
     return all(path.is_file() for path in expected_generation_paths(output_dir, key, prompts))
 
 
+def load_resume_timings(output_dir: str) -> dict:
+    """Load previously recorded per-image timings for resume runs."""
+    out_dir = Path(output_dir)
+    for name in ("timings.json", "timings.partial.json"):
+        path = out_dir / name
+        if not path.is_file():
+            continue
+        try:
+            with open(path, "r") as f:
+                report = json.load(f)
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"[resume] ignoring unreadable {path}: {exc}", flush=True)
+            continue
+        timings = report.get("per_image_round_times")
+        if isinstance(timings, dict):
+            return {
+                str(key): value
+                for key, value in timings.items()
+                if isinstance(value, list)
+            }
+    return {}
+
+
 def write_timing_report(path: Path, args, all_timings, cache_manager=None, final: bool = False):
     flat = [t for ts in all_timings.values() for t in ts]
     summary = {
@@ -63,6 +110,7 @@ def write_timing_report(path: Path, args, all_timings, cache_manager=None, final
         "avg_round_time": sum(flat) / len(flat) if flat else 0.0,
         "per_image_round_times": all_timings,
         "complete": bool(final),
+        "cuda_memory": _cuda_memory_report(args.num_gpus),
     }
     if (
         args.use_cache
@@ -202,6 +250,72 @@ def _print_cuda_memory(prefix: str, num_gpus: int):
         )
 
 
+def _reset_cuda_peak_memory(num_gpus: int):
+    if not torch.cuda.is_available():
+        return
+    for i in range(min(num_gpus, torch.cuda.device_count())):
+        try:
+            torch.cuda.reset_peak_memory_stats(i)
+        except RuntimeError as exc:
+            print(f"[warn] reset_peak_memory_stats(cuda:{i}) failed: {exc}")
+
+
+def _cuda_memory_report(num_gpus: int) -> dict:
+    if not torch.cuda.is_available():
+        return {
+            "available": False,
+            "source": "torch.cuda",
+            "requested_num_gpus": num_gpus,
+            "device_count": 0,
+            "per_gpu": [],
+        }
+
+    device_count = min(num_gpus, torch.cuda.device_count())
+    per_gpu = []
+    for i in range(device_count):
+        try:
+            torch.cuda.synchronize(i)
+        except RuntimeError as exc:
+            per_gpu.append({"device": i, "error": str(exc)})
+            continue
+        allocated = torch.cuda.memory_allocated(i)
+        reserved = torch.cuda.memory_reserved(i)
+        peak_allocated = torch.cuda.max_memory_allocated(i)
+        peak_reserved = torch.cuda.max_memory_reserved(i)
+        per_gpu.append(
+            {
+                "device": i,
+                "allocated_gib": allocated / 1024**3,
+                "reserved_gib": reserved / 1024**3,
+                "peak_allocated_gib": peak_allocated / 1024**3,
+                "peak_reserved_gib": peak_reserved / 1024**3,
+            }
+        )
+
+    peak_allocated_values = [
+        row["peak_allocated_gib"] for row in per_gpu
+        if isinstance(row.get("peak_allocated_gib"), (int, float))
+    ]
+    peak_reserved_values = [
+        row["peak_reserved_gib"] for row in per_gpu
+        if isinstance(row.get("peak_reserved_gib"), (int, float))
+    ]
+    return {
+        "available": True,
+        "source": "torch.cuda",
+        "requested_num_gpus": num_gpus,
+        "device_count": torch.cuda.device_count(),
+        "measured_num_gpus": device_count,
+        "per_gpu": per_gpu,
+        "max_peak_allocated_gib": (
+            max(peak_allocated_values) if peak_allocated_values else None
+        ),
+        "max_peak_reserved_gib": (
+            max(peak_reserved_values) if peak_reserved_values else None
+        ),
+    }
+
+
 def _dispatch_transformer_blocks(pipeline, args):
     """Dispatch Flux transformer blocks across GPUs instead of one GPU."""
     from accelerate import infer_auto_device_map
@@ -275,8 +389,22 @@ def build_pipeline_with_offload(args, *, enable_cache: bool = True):
         use_compression=enable_cache and args.use_cache_compression,
         compression_bitrate=args.compression_bitrate,
         compression_codec=args.compression_codec,
+        compression_rc_mode=args.compression_rc_mode,
+        compression_const_qp=args.compression_const_qp,
+        compression_bitrate_max_multiplier=args.compression_bitrate_max_multiplier,
         compression_gop_length=args.compression_gop_length,
         compression_frame_interval_p=args.compression_frame_interval_p,
+        compression_quant_group_size=args.compression_quant_group_size,
+        compression_quant_outlier_ratio=args.compression_quant_outlier_ratio,
+        compression_quant_error_probe_groups=parse_int_list(
+            args.compression_quant_error_probe_groups
+        ),
+        compression_quant_error_probe_outlier_ratios=parse_float_list(
+            args.compression_quant_error_probe_outlier_ratios
+        ),
+        compression_quant_error_probe_max_rows=(
+            args.compression_quant_error_probe_max_rows
+        ),
     )
 
     # Load pipeline directly from pretrained WITHOUT moving to device
@@ -523,10 +651,52 @@ def get_args():
                    help="Compression bitrate in Mbps for hevc/h264; ignored by lossless")
     p.add_argument("--compression-codec", choices=["lossless", "hevc", "h264"], default="lossless",
                    help="Compression codec: hevc/h264 are lossy NVENC paths; lossless uses HEVC/NVENC lossless over quantized frames")
+    p.add_argument("--compression-rc-mode", choices=["vbr", "cbr", "constqp"], default="vbr",
+                   help="Rate control for hevc/h264 compression")
+    p.add_argument("--compression-const-qp", type=int, default=None,
+                   help="Constant QP for --compression-rc-mode constqp; lower is higher quality and lower compression")
+    p.add_argument("--compression-bitrate-max-multiplier", type=float, default=10.0,
+                   help="Max bitrate multiplier for vbr/cbr codec modes")
     p.add_argument("--compression-gop-length", type=int, default=1,
                    help="Inter-layer GOP length for activation compression; <=1 keeps all-I frames")
     p.add_argument("--compression-frame-interval-p", type=int, default=1,
                    help="P-frame interval for inter-layer GOP compression (1 = IPPP)")
+    p.add_argument("--compression-quant-group-size", type=int, default=256,
+                   help="Group size for lossless FP16->uint8 activation quantization; <=0 forces channel-wise quantization")
+    p.add_argument(
+        "--compression-quant-outlier-ratio",
+        type=float,
+        default=0.0,
+        help=(
+            "Fraction of worst qg quantization residuals to store exactly "
+            "beside the codec payload; 0 disables residual outliers."
+        ),
+    )
+    p.add_argument(
+        "--compression-quant-error-probe-groups",
+        default="",
+        help=(
+            "Comma-separated qg candidates to estimate on real activations "
+            "without changing the actual compression qg. Use 0 for channel-wise."
+        ),
+    )
+    p.add_argument(
+        "--compression-quant-error-probe-outlier-ratios",
+        default="",
+        help=(
+            "Comma-separated residual-outlier ratios to combine with each "
+            "quant-error probe group, e.g. 0,0.0005,0.001."
+        ),
+    )
+    p.add_argument(
+        "--compression-quant-error-probe-max-rows",
+        type=int,
+        default=0,
+        help=(
+            "Max activation rows sampled per tensor for quant-error probe; "
+            "<=0 uses all rows."
+        ),
+    )
     p.add_argument(
         "--resume-skip-complete",
         action="store_true",
@@ -590,8 +760,10 @@ def main():
         offload_encoders_to_cpu(pipeline)
 
     os.makedirs(args.output_dir, exist_ok=True)
+    _reset_cuda_peak_memory(args.num_gpus)
     partial_report_path = Path(args.output_dir) / "timings.partial.json"
     all_timings = {}
+    resume_timings = load_resume_timings(args.output_dir) if args.resume_skip_complete else {}
     for row_index, row in enumerate(selected):
         key = row.get("image_idx") or row["file_name"]
         prompts = extract_instructions(row)
@@ -599,7 +771,7 @@ def main():
             prompts = prompts[:args.max_rounds]
         if args.resume_skip_complete and image_outputs_complete(args.output_dir, str(key), prompts):
             print(f"[resume] skip complete image {key} ({row_index + 1}/{len(selected)})", flush=True)
-            all_timings[key] = []
+            all_timings[key] = resume_timings.get(str(key), [])
             write_timing_report(partial_report_path, args, all_timings, cache_manager, final=False)
             continue
 
@@ -626,6 +798,16 @@ def main():
             f"payload={payload_ratio:.2f}x, "
             f"total={total_ratio:.2f}x"
         )
+    cuda_memory = summary.get("cuda_memory") or {}
+    if cuda_memory.get("available"):
+        peak_reserved = cuda_memory.get("max_peak_reserved_gib")
+        peak_allocated = cuda_memory.get("max_peak_allocated_gib")
+        if peak_reserved is not None and peak_allocated is not None:
+            print(
+                "cuda peak memory: "
+                f"allocated={peak_allocated:.2f}GiB, "
+                f"reserved={peak_reserved:.2f}GiB"
+            )
     print(f"report -> {report_path}")
     print(f"results -> {args.output_dir}")
     return 0

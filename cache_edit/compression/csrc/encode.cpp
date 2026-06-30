@@ -114,7 +114,7 @@ TensorEncoder::TensorEncoder(const TensorEncodeConfig& config, uint32_t maxWidth
         }
     }
     if (config.average_bit_rate.has_value()) {
-        encode_config.rcParams.averageBitRate = config.max_bit_rate.value();
+        encode_config.rcParams.averageBitRate = config.average_bit_rate.value();
     }
     if (config.max_bit_rate.has_value()) {
         encode_config.rcParams.maxBitRate = config.max_bit_rate.value();

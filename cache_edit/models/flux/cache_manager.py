@@ -4,6 +4,7 @@ import threading
 import time
 from bisect import bisect_right
 from concurrent.futures import Future, ThreadPoolExecutor
+from math import sqrt
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import torch
@@ -46,8 +47,16 @@ class FluxCacheManager(BaseCacheManager):
         use_compression: bool = False,
         compression_bitrate: float = 5.0,
         compression_codec: str = "lossless",
+        compression_rc_mode: str = "vbr",
+        compression_const_qp: Optional[int] = None,
+        compression_bitrate_max_multiplier: float = 10.0,
         compression_gop_length: int = 1,
         compression_frame_interval_p: int = 1,
+        compression_quant_group_size: int = 256,
+        compression_quant_outlier_ratio: float = 0.0,
+        compression_quant_error_probe_groups: Optional[List[int]] = None,
+        compression_quant_error_probe_outlier_ratios: Optional[List[float]] = None,
+        compression_quant_error_probe_max_rows: int = 0,
     ):
         """
         初始化 Flux 缓存管理器。
@@ -66,8 +75,23 @@ class FluxCacheManager(BaseCacheManager):
             compression_bitrate: 压缩码率（Mbps），仅 hevc/h264 有损模式使用
             compression_codec: 'lossless' 使用 HEVC/NVENC lossless 编码量化帧；
                 'hevc'/'h264' 使用有损视频编码
+            compression_rc_mode: hevc/h264 的码率控制模式：vbr/cbr/constqp
+            compression_const_qp: constqp 模式下使用的 QP；越小质量越高、压缩率越低
+            compression_bitrate_max_multiplier: vbr/cbr 模式 max bitrate 相对
+                average bitrate 的倍率
             compression_gop_length: 跨连续 layer 的 GOP 长度；<=1 表示全 I 帧
             compression_frame_interval_p: P 帧间隔；1 表示 IPPP
+            compression_quant_group_size: lossless codec 之前 FP16->uint8
+                group-wise 量化的 group size；<=0 表示强制使用 channel-wise
+                quantization
+            compression_quant_outlier_ratio: 可选异常 residual 比例；>0 时保存
+                最坏的少量量化 residual 作为辅助元数据
+            compression_quant_error_probe_groups: 可选 qg 列表；启用后在真实
+                activation 上额外估计这些量化方案的误差，不改变实际压缩配置
+            compression_quant_error_probe_outlier_ratios: 可选 residual 比例列表；
+                与 probe qg 列表做笛卡尔积估计
+            compression_quant_error_probe_max_rows: 每个 activation 最多采样多少
+                token/row 参与误差估计；<=0 表示全量估计
         """
         super().__init__(
             use_activation_cache=use_activation_cache,
@@ -87,8 +111,34 @@ class FluxCacheManager(BaseCacheManager):
         self.use_compression = use_compression
         self.compression_bitrate = compression_bitrate
         self.compression_codec = compression_codec
+        self.compression_rc_mode = str(compression_rc_mode or "vbr").lower()
+        self.compression_const_qp = (
+            None if compression_const_qp is None else int(compression_const_qp)
+        )
+        self.compression_bitrate_max_multiplier = float(
+            compression_bitrate_max_multiplier
+        )
         self.compression_gop_length = int(compression_gop_length or 1)
         self.compression_frame_interval_p = int(compression_frame_interval_p or 1)
+        self.compression_quant_group_size = int(compression_quant_group_size)
+        self.compression_quant_outlier_ratio = max(
+            0.0,
+            float(compression_quant_outlier_ratio or 0.0),
+        )
+        self.compression_quant_error_probe_groups = (
+            self._normalize_quant_error_probe_groups(
+                compression_quant_error_probe_groups
+            )
+        )
+        self.compression_quant_error_probe_outlier_ratios = (
+            self._normalize_quant_error_probe_outlier_ratios(
+                compression_quant_error_probe_outlier_ratios
+            )
+        )
+        self.compression_quant_error_probe_max_rows = max(
+            0,
+            int(compression_quant_error_probe_max_rows or 0),
+        )
 
         # 初始化压缩器（仅在需要时）
         self.compressor = None
@@ -97,6 +147,7 @@ class FluxCacheManager(BaseCacheManager):
         self._compression_current_image_key: Optional[str] = None
         self._compression_records: List[Dict[str, Any]] = []
         self._decompression_records: List[Dict[str, Any]] = []
+        self._quant_error_probe_records: List[Dict[str, Any]] = []
         self._async_compression_executor: Optional[ThreadPoolExecutor] = None
         self._async_compression_lock = threading.RLock()
         self._async_compression_futures: Dict[int, Future] = {}
@@ -136,6 +187,13 @@ class FluxCacheManager(BaseCacheManager):
                 self.compressor = ActivationCompressor(
                     bitrate=compression_bitrate,
                     codec=compression_codec,
+                    bitrate_max_multiplier=(
+                        self.compression_bitrate_max_multiplier
+                    ),
+                    quant_group_size=self.compression_quant_group_size,
+                    quant_outlier_ratio=self.compression_quant_outlier_ratio,
+                    rc_mode=self.compression_rc_mode,
+                    const_qp=self.compression_const_qp,
                 )
                 self.decompressor = ActivationDecompressor()
                 if self.compression_gop_length > 1:
@@ -153,12 +211,35 @@ class FluxCacheManager(BaseCacheManager):
                     gop_msg = ", all-I"
                 if str(compression_codec).lower() == "lossless":
                     codec_msg = f"{compression_codec} codec (bitrate ignored)"
+                elif self.compression_rc_mode == "constqp":
+                    codec_msg = (
+                        f"{compression_codec} constqp="
+                        f"{self.compression_const_qp}"
+                    )
                 else:
-                    codec_msg = f"{compression_codec} @ {compression_bitrate}Mbps"
+                    codec_msg = (
+                        f"{compression_codec} {self.compression_rc_mode} "
+                        f"@ {compression_bitrate}Mbps "
+                        f"(max_multiplier="
+                        f"{self.compression_bitrate_max_multiplier:g})"
+                    )
                 print(
                     f"[FluxCacheManager] Compression enabled: "
-                    f"{codec_msg}{gop_msg}"
+                    f"{codec_msg}{gop_msg}, "
+                    f"quant_group_size={self.compression_quant_group_size}, "
+                    f"quant_outlier_ratio={self.compression_quant_outlier_ratio}"
                 )
+                if self.compression_quant_error_probe_groups:
+                    groups = ",".join(
+                        "cw" if int(g) <= 0 else f"qg{int(g)}"
+                        for g in self.compression_quant_error_probe_groups
+                    )
+                    rows = self.compression_quant_error_probe_max_rows
+                    row_desc = "all rows" if rows <= 0 else f"max_rows={rows}"
+                    print(
+                        "[FluxCacheManager] Quantization error probe enabled: "
+                        f"{groups} ({row_desc})"
+                    )
             except Exception as e:
                 print(f"[FluxCacheManager] Failed to initialize compression: {e}")
                 print(f"[FluxCacheManager] Falling back to uncompressed cache")
@@ -428,6 +509,326 @@ class FluxCacheManager(BaseCacheManager):
             return None
         return float(numerator) / float(denominator)
 
+    @staticmethod
+    def _normalize_quant_error_probe_groups(
+        groups: Optional[List[int]],
+    ) -> List[int]:
+        if not groups:
+            return []
+        normalized: List[int] = []
+        seen: Set[int] = set()
+        for value in groups:
+            group_size = int(value)
+            if group_size in seen:
+                continue
+            normalized.append(group_size)
+            seen.add(group_size)
+        return normalized
+
+    @staticmethod
+    def _normalize_quant_error_probe_outlier_ratios(
+        ratios: Optional[List[float]],
+    ) -> List[float]:
+        if not ratios:
+            return [0.0]
+        normalized: List[float] = []
+        seen: Set[float] = set()
+        for value in ratios:
+            ratio = max(0.0, float(value))
+            rounded = round(ratio, 8)
+            if rounded in seen:
+                continue
+            normalized.append(ratio)
+            seen.add(rounded)
+        if 0.0 not in seen:
+            normalized.insert(0, 0.0)
+        return normalized
+
+    @staticmethod
+    def _format_quant_ratio(ratio: float) -> str:
+        text = f"{float(ratio):.8g}"
+        return text.replace(".", "p").replace("-", "m")
+
+    @classmethod
+    def _quant_probe_label(cls, group_size: int, outlier_ratio: float = 0.0) -> str:
+        base = "cw" if int(group_size) <= 0 else f"qg{int(group_size)}"
+        if float(outlier_ratio) > 0.0 and int(group_size) > 0:
+            return f"{base}_o{cls._format_quant_ratio(float(outlier_ratio))}"
+        return base
+
+    def _quant_error_probe_enabled(self) -> bool:
+        return bool(self.compression_quant_error_probe_groups)
+
+    def _activation_to_probe_matrix(self, tensor: Tensor) -> Tensor:
+        if tensor.dim() == 3:
+            _batch, _seq_len, hidden_dim = tensor.shape
+            matrix = tensor.reshape(-1, hidden_dim)
+        elif tensor.dim() == 2:
+            matrix = tensor
+        else:
+            raise ValueError(f"Unsupported activation shape for quant probe: {tensor.shape}")
+
+        max_rows = int(self.compression_quant_error_probe_max_rows)
+        if max_rows > 0 and matrix.shape[0] > max_rows:
+            # Deterministic uniform row sampling keeps layer-to-layer comparisons
+            # stable without materializing a random generator state.
+            row_idx = torch.linspace(
+                0,
+                matrix.shape[0] - 1,
+                steps=max_rows,
+                device=matrix.device,
+            ).round().long()
+            matrix = matrix.index_select(0, row_idx)
+
+        return matrix.detach().to(device="cpu", dtype=torch.float32)
+
+    @staticmethod
+    def _simulate_quant_roundtrip(
+        matrix: Tensor,
+        group_size: int,
+        outlier_ratio: float = 0.0,
+    ) -> Tuple[Optional[Tensor], Optional[str], int, int]:
+        height, width = matrix.shape
+        if int(group_size) <= 0:
+            min_val, _ = matrix.min(dim=1)
+            max_val, _ = matrix.max(dim=1)
+            scale = (max_val - min_val).clamp(min=1e-5) / 255.0
+            offset = min_val
+            q = torch.clamp(
+                torch.round((matrix - offset.unsqueeze(1)) / scale.unsqueeze(1)),
+                0,
+                255,
+            ).to(torch.uint8)
+            restored = q.float() * scale.unsqueeze(1) + offset.unsqueeze(1)
+            metadata_rows = int(height)
+            return restored, "channel_min_offset", metadata_rows, 0
+
+        group_size = int(group_size)
+        if width % group_size != 0:
+            return None, f"width {width} not divisible by qg{group_size}", 0, 0
+
+        grouped = matrix.reshape(-1, group_size)
+        min_val, _ = grouped.min(dim=1)
+        max_val, _ = grouped.max(dim=1)
+        scale = (max_val - min_val).clamp(min=1e-5) / 255.0
+        zero = torch.round(-min_val / scale)
+        q = torch.clamp(
+            torch.round(grouped / scale.unsqueeze(1)) + zero.unsqueeze(1),
+            0,
+            255,
+        ).to(torch.uint8)
+        restored = (
+            scale.unsqueeze(1) * (q.float() - zero.unsqueeze(1))
+        )
+        outlier_extra_bytes = 0
+        if float(outlier_ratio) > 0.0 and restored.numel() > 0:
+            residual = grouped - restored
+            k = int(round(float(restored.numel()) * float(outlier_ratio)))
+            k = max(0, min(k, int(restored.numel())))
+            if k > 0:
+                _, indices = torch.topk(residual.abs().reshape(-1), k=k, largest=True)
+                restored.reshape(-1)[indices] += residual.reshape(-1)[indices]
+                # int32 flat index + float16 residual per corrected element.
+                outlier_extra_bytes = int(k * (4 + 2))
+        restored = restored.reshape_as(matrix)
+        metadata_rows = int(height * width // group_size)
+        variant = (
+            "group_round_zero_point_outlier"
+            if float(outlier_ratio) > 0.0
+            else "group_round_zero_point"
+        )
+        return restored, variant, metadata_rows, outlier_extra_bytes
+
+    def _quant_error_probe_for_tensor(
+        self,
+        tensor: Tensor,
+        group_size: int,
+        outlier_ratio: float = 0.0,
+    ) -> Dict[str, Any]:
+        full_rows = int(tensor.reshape(-1, tensor.shape[-1]).shape[0])
+        width = int(tensor.shape[-1])
+        original_numel = int(tensor.numel())
+        original_bytes = self._tensor_nbytes(tensor)
+        matrix = self._activation_to_probe_matrix(tensor)
+        restored, variant_or_error, metadata_rows, outlier_extra_bytes = self._simulate_quant_roundtrip(
+            matrix,
+            int(group_size),
+            float(outlier_ratio),
+        )
+
+        label = self._quant_probe_label(int(group_size), float(outlier_ratio))
+        if restored is None:
+            return {
+                "quantization": label,
+                "quant_group_size": int(group_size),
+                "status": "skipped",
+                "error": str(variant_or_error),
+                "original_numel": original_numel,
+                "sampled_numel": int(matrix.numel()),
+                "full_rows": full_rows,
+                "sampled_rows": int(matrix.shape[0]),
+                "width": width,
+                "original_bytes": original_bytes,
+                "metadata_bytes": 0,
+                "quant_outlier_ratio": float(outlier_ratio),
+            }
+
+        err = restored - matrix
+        abs_err = err.abs()
+        mse_sum = float((err * err).sum().item())
+        abs_sum = float(abs_err.sum().item())
+        max_abs = float(abs_err.max().item()) if err.numel() else 0.0
+        signal_sq_sum = float((matrix * matrix).sum().item())
+        # Current implementation stores scale and offset as float32 tensors.
+        metadata_bytes = int(metadata_rows * 2 * 4 + outlier_extra_bytes)
+        return {
+            "quantization": label,
+            "quant_group_size": int(group_size),
+            "quant_outlier_ratio": float(outlier_ratio),
+            "quantization_variant": str(variant_or_error),
+            "status": "ok",
+            "original_numel": original_numel,
+            "sampled_numel": int(matrix.numel()),
+            "full_rows": full_rows,
+            "sampled_rows": int(matrix.shape[0]),
+            "width": width,
+            "original_bytes": original_bytes,
+            "metadata_rows": int(metadata_rows),
+            "metadata_bytes": metadata_bytes,
+            "outlier_extra_metadata_bytes": int(outlier_extra_bytes),
+            "mse_sum": mse_sum,
+            "abs_sum": abs_sum,
+            "max_abs": max_abs,
+            "signal_sq_sum": signal_sq_sum,
+        }
+
+    def _record_quant_error_probe_group(
+        self,
+        *,
+        stream: StreamType,
+        step: int,
+        layer_indices: List[int],
+        tensors: List[Tensor],
+    ) -> None:
+        if not self._quant_error_probe_enabled():
+            return
+
+        for group_size in self.compression_quant_error_probe_groups:
+            outlier_ratios = (
+                self.compression_quant_error_probe_outlier_ratios
+                if int(group_size) > 0
+                else [0.0]
+            )
+            for outlier_ratio in outlier_ratios:
+                self._record_quant_error_probe_one_setting(
+                    stream=stream,
+                    step=step,
+                    layer_indices=layer_indices,
+                    tensors=tensors,
+                    group_size=int(group_size),
+                    outlier_ratio=float(outlier_ratio),
+                )
+
+    def _record_quant_error_probe_one_setting(
+        self,
+        *,
+        stream: StreamType,
+        step: int,
+        layer_indices: List[int],
+        tensors: List[Tensor],
+        group_size: int,
+        outlier_ratio: float,
+    ) -> None:
+        ok = True
+        error = None
+        agg = {
+            "mse_sum": 0.0,
+            "abs_sum": 0.0,
+            "max_abs": 0.0,
+            "signal_sq_sum": 0.0,
+            "sampled_numel": 0,
+            "original_numel": 0,
+            "original_bytes": 0,
+            "metadata_bytes": 0,
+            "outlier_extra_metadata_bytes": 0,
+        }
+        variant = None
+        sampled_rows = 0
+        full_rows = 0
+        width = None
+        for tensor in tensors:
+            result = self._quant_error_probe_for_tensor(
+                tensor,
+                int(group_size),
+                float(outlier_ratio),
+            )
+            if result.get("status") != "ok":
+                ok = False
+                error = result.get("error")
+                break
+            variant = result.get("quantization_variant")
+            sampled_rows += int(result.get("sampled_rows", 0) or 0)
+            full_rows += int(result.get("full_rows", 0) or 0)
+            width = int(result.get("width", 0) or 0)
+            for key in (
+                "mse_sum",
+                "abs_sum",
+                "signal_sq_sum",
+            ):
+                agg[key] += float(result.get(key, 0.0) or 0.0)
+            agg["max_abs"] = max(
+                float(agg["max_abs"]),
+                float(result.get("max_abs", 0.0) or 0.0),
+            )
+            for key in (
+                "sampled_numel",
+                "original_numel",
+                "original_bytes",
+                "metadata_bytes",
+                "outlier_extra_metadata_bytes",
+            ):
+                agg[key] += int(result.get(key, 0) or 0)
+
+        quantization = self._quant_probe_label(
+            int(group_size),
+            float(outlier_ratio),
+        )
+        record = {
+            "status": "ok" if ok else "skipped",
+            "image_key": self._compression_current_image_key,
+            "round": int(self.current_round),
+            "step": int(step),
+            "layer": int(layer_indices[0]),
+            "layers": [int(x) for x in layer_indices],
+            "stream": str(stream),
+            "frame_count": len(tensors),
+            "quantization": quantization,
+            "quant_group_size": int(group_size),
+            "quant_outlier_ratio": float(outlier_ratio),
+            "quantization_variant": variant,
+            "sampled_rows": int(sampled_rows),
+            "full_rows": int(full_rows),
+            "width": width,
+            **agg,
+        }
+        if ok and int(agg["sampled_numel"]) > 0:
+            sampled_numel = int(agg["sampled_numel"])
+            signal_sq_sum = float(agg["signal_sq_sum"])
+            record["rmse"] = sqrt(float(agg["mse_sum"]) / sampled_numel)
+            record["mae"] = float(agg["abs_sum"]) / sampled_numel
+            record["relative_rmse"] = (
+                sqrt(float(agg["mse_sum"]) / signal_sq_sum)
+                if signal_sq_sum > 0
+                else None
+            )
+            record["metadata_over_original_ratio"] = self._safe_ratio(
+                int(agg["metadata_bytes"]),
+                int(agg["original_bytes"]),
+            )
+        else:
+            record["error"] = error
+        self._quant_error_probe_records.append(record)
+
     def _record_compression_success(
         self,
         *,
@@ -456,7 +857,13 @@ class FluxCacheManager(BaseCacheManager):
                 "source_device": str(tensor.device),
                 "cache_device": str(cache_device),
                 "codec": str(self.compression_codec),
+                "rc_mode": str(self.compression_rc_mode),
+                "const_qp": self.compression_const_qp,
+                "bitrate_max_multiplier": self.compression_bitrate_max_multiplier,
                 "quantization": compressed.get("quantization"),
+                "quantization_variant": compressed.get("quantization_variant"),
+                "quant_group_size": compressed.get("quant_group_size"),
+                "quant_outlier_ratio": compressed.get("quant_outlier_ratio", 0.0),
                 "bitrate_mbps": float(self.compression_bitrate),
                 "compression_mode": compressed.get(
                     "compression_mode", "intra_layer"
@@ -504,7 +911,13 @@ class FluxCacheManager(BaseCacheManager):
                 "source_device": str(tensors[0].device),
                 "cache_device": str(cache_device),
                 "codec": str(self.compression_codec),
+                "rc_mode": str(self.compression_rc_mode),
+                "const_qp": self.compression_const_qp,
+                "bitrate_max_multiplier": self.compression_bitrate_max_multiplier,
                 "quantization": compressed.get("quantization"),
+                "quantization_variant": compressed.get("quantization_variant"),
+                "quant_group_size": compressed.get("quant_group_size"),
+                "quant_outlier_ratio": compressed.get("quant_outlier_ratio", 0.0),
                 "bitrate_mbps": float(self.compression_bitrate),
                 "compression_mode": compressed.get(
                     "compression_mode", "inter_layer_gop"
@@ -550,7 +963,13 @@ class FluxCacheManager(BaseCacheManager):
                 "source_device": str(tensor.device),
                 "cache_device": str(cache_device),
                 "codec": str(self.compression_codec),
+                "rc_mode": str(self.compression_rc_mode),
+                "const_qp": self.compression_const_qp,
+                "bitrate_max_multiplier": self.compression_bitrate_max_multiplier,
                 "quantization": None,
+                "quantization_variant": None,
+                "quant_group_size": self.compression_quant_group_size,
+                "quant_outlier_ratio": self.compression_quant_outlier_ratio,
                 "bitrate_mbps": float(self.compression_bitrate),
                 "original_bytes": original_bytes,
                 "stored_uncompressed_bytes": original_bytes,
@@ -584,7 +1003,13 @@ class FluxCacheManager(BaseCacheManager):
                 "source_device": str(tensors[0].device),
                 "cache_device": str(cache_device),
                 "codec": str(self.compression_codec),
+                "rc_mode": str(self.compression_rc_mode),
+                "const_qp": self.compression_const_qp,
+                "bitrate_max_multiplier": self.compression_bitrate_max_multiplier,
                 "quantization": None,
+                "quantization_variant": None,
+                "quant_group_size": self.compression_quant_group_size,
+                "quant_outlier_ratio": self.compression_quant_outlier_ratio,
                 "bitrate_mbps": float(self.compression_bitrate),
                 "compression_mode": "inter_layer_gop",
                 "gop_length": int(self.compression_gop_length),
@@ -659,6 +1084,14 @@ class FluxCacheManager(BaseCacheManager):
                     "load_kind": str(load_kind),
                     "compression_mode": compressed_data.get(
                         "compression_mode", "intra_layer"
+                    ),
+                    "quantization": compressed_data.get("quantization"),
+                    "quantization_variant": compressed_data.get(
+                        "quantization_variant"
+                    ),
+                    "quant_group_size": compressed_data.get("quant_group_size"),
+                    "quant_outlier_ratio": compressed_data.get(
+                        "quant_outlier_ratio", 0.0
                     ),
                     "gop_length": compressed_data.get("gop_length"),
                     "frame_index": (
@@ -763,7 +1196,13 @@ class FluxCacheManager(BaseCacheManager):
                 ),
                 "cache_device": str(cache_device),
                 "codec": str(self.compression_codec),
+                "rc_mode": str(self.compression_rc_mode),
+                "const_qp": self.compression_const_qp,
+                "bitrate_max_multiplier": self.compression_bitrate_max_multiplier,
                 "quantization": compressed.get("quantization"),
+                "quantization_variant": compressed.get("quantization_variant"),
+                "quant_group_size": compressed.get("quant_group_size"),
+                "quant_outlier_ratio": compressed.get("quant_outlier_ratio", 0.0),
                 "bitrate_mbps": float(self.compression_bitrate),
                 "compression_mode": compressed.get(
                     "compression_mode", "inter_layer_gop"
@@ -821,7 +1260,13 @@ class FluxCacheManager(BaseCacheManager):
                 ),
                 "cache_device": str(cache_device),
                 "codec": str(self.compression_codec),
+                "rc_mode": str(self.compression_rc_mode),
+                "const_qp": self.compression_const_qp,
+                "bitrate_max_multiplier": self.compression_bitrate_max_multiplier,
                 "quantization": None,
+                "quantization_variant": None,
+                "quant_group_size": self.compression_quant_group_size,
+                "quant_outlier_ratio": self.compression_quant_outlier_ratio,
                 "bitrate_mbps": float(self.compression_bitrate),
                 "compression_mode": "inter_layer_gop",
                 "gop_length": int(self.compression_gop_length),
@@ -1531,6 +1976,12 @@ class FluxCacheManager(BaseCacheManager):
         key = (stream, self.current_step, layer_idx)
         t0 = time.time()
         try:
+            self._record_quant_error_probe_group(
+                stream=stream,
+                step=int(self.current_step),
+                layer_indices=[int(layer_idx)],
+                tensors=[tensor.detach()],
+            )
             compressed = self.compressor.compress(
                 tensor,
                 name=f"step{self.current_step}_layer{layer_idx}",
@@ -1673,6 +2124,12 @@ class FluxCacheManager(BaseCacheManager):
 
         tensor_devices = [tensor.device for tensor in tensors]
         staged_tensors = [tensor.detach().to("cpu", copy=True) for tensor in tensors]
+        self._record_quant_error_probe_group(
+            stream=stream,
+            step=int(pending["step"]),
+            layer_indices=layer_indices,
+            tensors=staged_tensors,
+        )
 
         job_id = self._make_async_compression_job_id()
         step = int(pending["step"])
@@ -2260,6 +2717,7 @@ class FluxCacheManager(BaseCacheManager):
         self._drain_async_compression(wait=True)
         self._compression_records.clear()
         self._decompression_records.clear()
+        self._quant_error_probe_records.clear()
         self._gop_prefetch_records.clear()
         self._async_compression_wait_time_s = 0.0
         self._async_compression_wait_count = 0
@@ -2364,11 +2822,18 @@ class FluxCacheManager(BaseCacheManager):
         )
         by_mode: Dict[str, int] = {}
         by_quantization: Dict[str, int] = {}
+        by_quantization_variant: Dict[str, int] = {}
         for record in success_records:
             mode = str(record.get("compression_mode", "intra_layer"))
             by_mode[mode] = by_mode.get(mode, 0) + 1
             quantization = str(record.get("quantization") or "unknown")
             by_quantization[quantization] = by_quantization.get(quantization, 0) + 1
+            quantization_variant = str(
+                record.get("quantization_variant") or "unknown"
+            )
+            by_quantization_variant[quantization_variant] = (
+                by_quantization_variant.get(quantization_variant, 0) + 1
+            )
         async_success_records = [
             r for r in success_records if bool(r.get("async"))
         ]
@@ -2387,15 +2852,89 @@ class FluxCacheManager(BaseCacheManager):
                 for r in async_success_records
             )
         )
+        quant_probe_by_quantization: Dict[str, Dict[str, Any]] = {}
+        for record in self._quant_error_probe_records:
+            quantization = str(record.get("quantization") or "unknown")
+            bucket = quant_probe_by_quantization.setdefault(
+                quantization,
+                {
+                    "record_count": 0,
+                    "skipped_count": 0,
+                    "sampled_numel": 0,
+                    "original_numel": 0,
+                    "original_bytes": 0,
+                    "metadata_bytes": 0,
+                    "outlier_extra_metadata_bytes": 0,
+                    "mse_sum": 0.0,
+                    "abs_sum": 0.0,
+                    "max_abs": 0.0,
+                    "signal_sq_sum": 0.0,
+                },
+            )
+            bucket["record_count"] += 1
+            if record.get("status") != "ok":
+                bucket["skipped_count"] += 1
+                continue
+            for key in (
+                "sampled_numel",
+                "original_numel",
+                "original_bytes",
+                "metadata_bytes",
+                "outlier_extra_metadata_bytes",
+            ):
+                bucket[key] += int(record.get(key, 0) or 0)
+            for key in ("mse_sum", "abs_sum", "signal_sq_sum"):
+                bucket[key] += float(record.get(key, 0.0) or 0.0)
+            bucket["max_abs"] = max(
+                float(bucket["max_abs"]),
+                float(record.get("max_abs", 0.0) or 0.0),
+            )
+        for bucket in quant_probe_by_quantization.values():
+            sampled_numel = int(bucket.get("sampled_numel", 0) or 0)
+            signal_sq_sum = float(bucket.get("signal_sq_sum", 0.0) or 0.0)
+            if sampled_numel > 0:
+                bucket["rmse"] = sqrt(float(bucket["mse_sum"]) / sampled_numel)
+                bucket["mae"] = float(bucket["abs_sum"]) / sampled_numel
+                bucket["relative_rmse"] = (
+                    sqrt(float(bucket["mse_sum"]) / signal_sq_sum)
+                    if signal_sq_sum > 0
+                    else None
+                )
+            else:
+                bucket["rmse"] = None
+                bucket["mae"] = None
+                bucket["relative_rmse"] = None
+            bucket["metadata_over_original_ratio"] = self._safe_ratio(
+                int(bucket.get("metadata_bytes", 0) or 0),
+                int(bucket.get("original_bytes", 0) or 0),
+            )
 
         summary = {
             "enabled": bool(self.use_compression),
             "codec": str(self.compression_codec),
             "bitrate_mbps": float(self.compression_bitrate),
+            "rc_mode": str(self.compression_rc_mode),
+            "const_qp": self.compression_const_qp,
+            "bitrate_max_multiplier": self.compression_bitrate_max_multiplier,
+            "quant_group_size": int(self.compression_quant_group_size),
+            "quant_outlier_ratio": float(self.compression_quant_outlier_ratio),
             "configured_gop_length": int(self.compression_gop_length),
             "configured_frame_interval_p": int(self.compression_frame_interval_p),
             "success_count_by_mode": by_mode,
             "success_count_by_quantization": by_quantization,
+            "success_count_by_quantization_variant": by_quantization_variant,
+            "quant_error_probe_enabled": self._quant_error_probe_enabled(),
+            "quant_error_probe_groups": [
+                int(x) for x in self.compression_quant_error_probe_groups
+            ],
+            "quant_error_probe_outlier_ratios": [
+                float(x)
+                for x in self.compression_quant_error_probe_outlier_ratios
+            ],
+            "quant_error_probe_max_rows": int(
+                self.compression_quant_error_probe_max_rows
+            ),
+            "quant_error_probe_by_quantization": quant_probe_by_quantization,
             "attempt_count": len(self._compression_records),
             "success_count": len(success_records),
             "failure_count": len(failure_records),
@@ -2481,6 +3020,9 @@ class FluxCacheManager(BaseCacheManager):
         if include_records:
             report["compression_records"] = list(self._compression_records)
             report["decompression_records"] = list(self._decompression_records)
+            report["quant_error_probe_records"] = list(
+                self._quant_error_probe_records
+            )
             report["gop_prefetch_records"] = list(self._gop_prefetch_records)
         return report
 

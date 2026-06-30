@@ -34,6 +34,12 @@ COMPRESSION_GOP_LENGTH="16"
 # P-frame interval inside the NVENC GOP.
 COMPRESSION_FRAME_INTERVAL_P="16"
 
+# Group size for lossless FP16->uint8 activation quantization before codec.
+# Smaller values usually improve precision but increase scale/offset metadata;
+# larger values may improve total compression ratio but can lose more precision.
+# Use 0 to force channel-wise quantization.
+COMPRESSION_QUANT_GROUP_SIZE="256"
+
 mkdir -p "${OUTPUT_DIR}"
 LOG_FILE="${OUTPUT_DIR}/run_$(date +%Y%m%d_%H%M%S).log"
 
@@ -66,5 +72,6 @@ python -u scripts/run_flux_multi_gpu_optimized.py \
     --compression-codec "${COMPRESSION_CODEC}" \
     --compression-gop-length "${COMPRESSION_GOP_LENGTH}" \
     --compression-frame-interval-p "${COMPRESSION_FRAME_INTERVAL_P}" \
+    --compression-quant-group-size "${COMPRESSION_QUANT_GROUP_SIZE}" \
     --resume-skip-complete \
     > "${LOG_FILE}" 2>&1
