@@ -67,6 +67,29 @@ def parse_float_list(value: str):
     return items
 
 
+def parse_str_list(value: str):
+    if value is None:
+        return []
+    items = []
+    for item in str(value).split(","):
+        item = item.strip()
+        if not item:
+            continue
+        items.append(item)
+    return items
+
+
+def parse_optional_bool(value: str):
+    value = str(value or "auto").strip().lower()
+    if value in ("auto", "none", ""):
+        return None
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if value in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"Unsupported boolean value: {value}")
+
+
 def expected_generation_paths(output_dir: str, key: str, prompts):
     gen_dir = Path(output_dir) / "generation"
     return [
@@ -411,11 +434,50 @@ def build_pipeline_with_offload(args, *, enable_cache: bool = True):
         compression_codec=args.compression_codec,
         compression_rc_mode=args.compression_rc_mode,
         compression_const_qp=args.compression_const_qp,
+        compression_const_qp_intra=args.compression_const_qp_intra,
+        compression_const_qp_inter_p=args.compression_const_qp_inter_p,
+        compression_const_qp_inter_b=args.compression_const_qp_inter_b,
         compression_bitrate_max_multiplier=args.compression_bitrate_max_multiplier,
+        compression_codec_preset=args.compression_codec_preset,
+        compression_codec_tuning=args.compression_codec_tuning,
+        compression_codec_spatial_aq=args.compression_codec_spatial_aq,
+        compression_codec_temporal_aq=parse_optional_bool(
+            args.compression_codec_temporal_aq
+        ),
+        compression_codec_target_quality=args.compression_codec_target_quality,
+        compression_quality_steps=set(parse_int_list(args.compression_quality_steps)),
+        compression_quality_bitrate=args.compression_quality_bitrate,
+        compression_quality_codec=args.compression_quality_codec,
+        compression_quality_rc_mode=args.compression_quality_rc_mode,
+        compression_quality_const_qp=args.compression_quality_const_qp,
+        compression_quality_const_qp_intra=args.compression_quality_const_qp_intra,
+        compression_quality_const_qp_inter_p=(
+            args.compression_quality_const_qp_inter_p
+        ),
+        compression_quality_const_qp_inter_b=(
+            args.compression_quality_const_qp_inter_b
+        ),
+        compression_quality_bitrate_max_multiplier=(
+            args.compression_quality_bitrate_max_multiplier
+        ),
+        compression_quality_codec_preset=args.compression_quality_codec_preset,
+        compression_quality_codec_tuning=args.compression_quality_codec_tuning,
+        compression_quality_codec_spatial_aq=(
+            args.compression_quality_codec_spatial_aq
+        ),
+        compression_quality_codec_temporal_aq=parse_optional_bool(
+            args.compression_quality_codec_temporal_aq
+        ),
+        compression_quality_codec_target_quality=(
+            args.compression_quality_codec_target_quality
+        ),
+        compression_quality_streams=set(parse_str_list(args.compression_quality_streams)),
         compression_gop_length=args.compression_gop_length,
+        compression_gop_start_layer=args.compression_gop_start_layer,
         compression_frame_interval_p=args.compression_frame_interval_p,
         compression_quant_group_size=args.compression_quant_group_size,
         compression_quant_outlier_ratio=args.compression_quant_outlier_ratio,
+        compression_codec_residual_ratio=args.compression_codec_residual_ratio,
         compression_quant_error_probe_groups=parse_int_list(
             args.compression_quant_error_probe_groups
         ),
@@ -703,10 +765,58 @@ def get_args():
                    help="Rate control for hevc/h264 compression")
     p.add_argument("--compression-const-qp", type=int, default=None,
                    help="Constant QP for --compression-rc-mode constqp; lower is higher quality and lower compression")
+    p.add_argument("--compression-const-qp-intra", type=int, default=None,
+                   help="Optional I-frame QP override for constqp mode")
+    p.add_argument("--compression-const-qp-inter-p", type=int, default=None,
+                   help="Optional P-frame QP override for constqp mode")
+    p.add_argument("--compression-const-qp-inter-b", type=int, default=None,
+                   help="Optional B-frame QP override for constqp mode")
     p.add_argument("--compression-bitrate-max-multiplier", type=float, default=10.0,
                    help="Max bitrate multiplier for vbr/cbr codec modes")
+    p.add_argument("--compression-codec-preset", choices=["p1", "p2", "p3", "p4", "p5", "p6", "p7"], default="p7",
+                   help="NVENC preset for hevc/h264. p7 is highest quality/slowest; p1 is fastest")
+    p.add_argument("--compression-codec-tuning", choices=["high_quality", "low_latency", "ultra_low_latency"], default="high_quality",
+                   help="NVENC tuning info for hevc/h264")
+    p.add_argument("--compression-codec-spatial-aq", type=int, default=None,
+                   help="Optional NVENC spatial AQ strength for hevc/h264")
+    p.add_argument("--compression-codec-temporal-aq", choices=["auto", "on", "off"], default="auto",
+                   help="Optional NVENC temporal AQ toggle for hevc/h264")
+    p.add_argument("--compression-codec-target-quality", type=int, default=None,
+                   help="Optional NVENC targetQuality for VBR hevc/h264")
+    p.add_argument("--compression-quality-steps", default="",
+                   help="Comma-separated cache steps that use the quality compression profile")
+    p.add_argument("--compression-quality-bitrate", type=float, default=None,
+                   help="Quality profile bitrate in Mbps; default inherits --compression-bitrate")
+    p.add_argument("--compression-quality-codec", choices=["lossless", "hevc", "h264"], default=None,
+                   help="Quality profile codec; default inherits --compression-codec")
+    p.add_argument("--compression-quality-rc-mode", choices=["vbr", "cbr", "constqp"], default=None,
+                   help="Quality profile rate control; default inherits --compression-rc-mode")
+    p.add_argument("--compression-quality-const-qp", type=int, default=None,
+                   help="Quality profile const QP")
+    p.add_argument("--compression-quality-const-qp-intra", type=int, default=None,
+                   help="Quality profile I-frame QP override")
+    p.add_argument("--compression-quality-const-qp-inter-p", type=int, default=None,
+                   help="Quality profile P-frame QP override")
+    p.add_argument("--compression-quality-const-qp-inter-b", type=int, default=None,
+                   help="Quality profile B-frame QP override")
+    p.add_argument("--compression-quality-bitrate-max-multiplier", type=float, default=None,
+                   help="Quality profile max bitrate multiplier")
+    p.add_argument("--compression-quality-codec-preset", choices=["p1", "p2", "p3", "p4", "p5", "p6", "p7"], default=None,
+                   help="Quality profile NVENC preset")
+    p.add_argument("--compression-quality-codec-tuning", choices=["high_quality", "low_latency", "ultra_low_latency"], default=None,
+                   help="Quality profile NVENC tuning")
+    p.add_argument("--compression-quality-codec-spatial-aq", type=int, default=None,
+                   help="Quality profile spatial AQ strength")
+    p.add_argument("--compression-quality-codec-temporal-aq", choices=["auto", "on", "off"], default="auto",
+                   help="Quality profile temporal AQ toggle")
+    p.add_argument("--compression-quality-codec-target-quality", type=int, default=None,
+                   help="Quality profile NVENC targetQuality")
+    p.add_argument("--compression-quality-streams", default="",
+                   help="Comma-separated stream names that use the quality profile, e.g. double,single; empty applies quality profile to all streams in quality steps")
     p.add_argument("--compression-gop-length", type=int, default=1,
                    help="Inter-layer GOP length for activation compression; <=1 keeps all-I frames")
+    p.add_argument("--compression-gop-start-layer", type=int, default=0,
+                   help="Layers below this index are compressed as single frames; this layer starts the inter-layer GOP reference frame")
     p.add_argument("--compression-frame-interval-p", type=int, default=1,
                    help="P-frame interval for inter-layer GOP compression (1 = IPPP)")
     p.add_argument("--compression-quant-group-size", type=int, default=256,
@@ -718,6 +828,15 @@ def get_args():
         help=(
             "Fraction of worst qg quantization residuals to store exactly "
             "beside the codec payload; 0 disables residual outliers."
+        ),
+    )
+    p.add_argument(
+        "--compression-codec-residual-ratio",
+        type=float,
+        default=0.0,
+        help=(
+            "Fraction of largest post-codec activation residuals to store "
+            "exactly beside the codec payload; 0 disables codec residuals."
         ),
     )
     p.add_argument(

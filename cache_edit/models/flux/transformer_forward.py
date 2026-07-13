@@ -86,6 +86,36 @@ def _move_if_needed(tensor: Optional[torch.Tensor], device: torch.device):
     return tensor.to(device)
 
 
+def _debug_check_tensor(ctx, name: str, tensor: Optional[torch.Tensor]) -> None:
+    if os.environ.get("CACHEEDIT_DEBUG_FINITE") != "1":
+        return
+    if tensor is None:
+        return
+    with torch.no_grad():
+        finite = bool(torch.isfinite(tensor).all().item())
+    if finite:
+        return
+    max_abs = float(tensor.detach().float().abs().max().item())
+    reported = getattr(ctx, "_debug_finite_reported", None)
+    if reported is None:
+        reported = set()
+        setattr(ctx, "_debug_finite_reported", reported)
+    key = (
+        int(getattr(ctx, "current_round", -1)),
+        int(getattr(ctx, "current_step", -1)),
+        name,
+    )
+    if key in reported:
+        return
+    reported.add(key)
+    print(
+        "[CacheDebug] transformer activation anomaly: "
+        f"round={getattr(ctx, 'current_round', 'n/a')} "
+        f"step={getattr(ctx, 'current_step', 'n/a')} "
+        f"{name} finite={finite} max_abs={max_abs:.6g}"
+    )
+
+
 def _validated_key_token_indices_cpu(
     key_token_indices: Optional[torch.Tensor],
     *,
@@ -408,6 +438,7 @@ def cache_flux_transformer_2d_forward(
         finally:
             ctx.key_token_indices = key_token_indices_for_block
 
+        _debug_check_tensor(ctx, f"double.{index_block}.block_hidden", hidden_states)
         if should_reuse:
             prev = cached_prev
             if prev is not None and effective_key_token_indices is not None:
@@ -415,6 +446,9 @@ def cache_flux_transformer_2d_forward(
                 mask_prev_cpu[effective_key_token_indices] = False
                 prev = prev[:, mask_prev_cpu.to(prev.device), :]
                 hidden_states = torch.cat((hidden_states, prev), dim=1)
+                _debug_check_tensor(
+                    ctx, f"double.{index_block}.after_reuse_cat", hidden_states
+                )
             del cached_prev
 
         ctx.maby_store_activation(
@@ -502,6 +536,7 @@ def cache_flux_transformer_2d_forward(
         finally:
             ctx.key_token_indices = key_token_indices_for_block
 
+        _debug_check_tensor(ctx, f"single.{index_block}.block_hidden", hidden_states)
         if should_reuse:
             prev = cached_prev
             if prev is not None and effective_key_token_indices is not None:
@@ -509,6 +544,9 @@ def cache_flux_transformer_2d_forward(
                 mask_prev_cpu[effective_key_token_indices] = False
                 prev = prev[:, mask_prev_cpu.to(prev.device), :]
                 hidden_states = torch.cat((hidden_states, prev), dim=1)
+                _debug_check_tensor(
+                    ctx, f"single.{index_block}.after_reuse_cat", hidden_states
+                )
             del cached_prev
 
         ctx.maby_store_activation(
@@ -545,13 +583,16 @@ def cache_flux_transformer_2d_forward(
 
     # ---- restore token order if reused ----
     hidden_states = ctx.maybe_restore_img_order(img=hidden_states)
+    _debug_check_tensor(ctx, "after_restore", hidden_states)
 
     out_device = _module_device(self.norm_out) or hidden_states.device
     hidden_states = _move_if_needed(hidden_states, out_device)
     temb = _move_if_needed(temb, out_device)
 
     hidden_states = self.norm_out(hidden_states, temb)
+    _debug_check_tensor(ctx, "after_norm_out", hidden_states)
     output = self.proj_out(hidden_states)
+    _debug_check_tensor(ctx, "after_proj_out", output)
 
     if USE_PEFT_BACKEND:
         unscale_lora_layers(self, lora_scale)

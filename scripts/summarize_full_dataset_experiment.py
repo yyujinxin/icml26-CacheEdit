@@ -203,15 +203,58 @@ def _mode_summary_rows(
                     "compression_codec": compressed_comp.get("codec"),
                     "compression_rc_mode": compressed_comp.get("rc_mode"),
                     "compression_const_qp": compressed_comp.get("const_qp"),
+                    "compression_const_qp_intra": compressed_comp.get(
+                        "const_qp_intra"
+                    ),
+                    "compression_const_qp_inter_p": compressed_comp.get(
+                        "const_qp_inter_p"
+                    ),
+                    "compression_const_qp_inter_b": compressed_comp.get(
+                        "const_qp_inter_b"
+                    ),
                     "compression_bitrate_mbps": compressed_comp.get("bitrate_mbps"),
+                    "compression_bitrate_max_multiplier": compressed_comp.get(
+                        "bitrate_max_multiplier"
+                    ),
+                    "compression_codec_preset": compressed_comp.get("codec_preset"),
+                    "compression_codec_tuning": compressed_comp.get("codec_tuning"),
+                    "compression_codec_spatial_aq": compressed_comp.get(
+                        "codec_spatial_aq"
+                    ),
+                    "compression_codec_temporal_aq": compressed_comp.get(
+                        "codec_temporal_aq"
+                    ),
+                    "compression_codec_target_quality": compressed_comp.get(
+                        "codec_target_quality"
+                    ),
                     "compression_gop_length": compressed_comp.get(
                         "configured_gop_length"
+                    ),
+                    "compression_gop_start_layer": compressed_comp.get(
+                        "configured_gop_start_layer"
                     ),
                     "compression_frame_interval_p": compressed_comp.get(
                         "configured_frame_interval_p"
                     ),
                     "compression_quant_group_size": compressed_comp.get(
                         "quant_group_size"
+                    ),
+                    "compression_quant_outlier_ratio": compressed_comp.get(
+                        "quant_outlier_ratio"
+                    ),
+                    "compression_codec_residual_ratio": compressed_comp.get(
+                        "codec_residual_ratio"
+                    ),
+                    "compression_quality_steps": compressed_comp.get(
+                        "quality_steps"
+                    ),
+                    "compression_quality_streams": json.dumps(
+                        compressed_comp.get("quality_streams") or [],
+                        ensure_ascii=False,
+                    ),
+                    "compression_success_count_by_profile": json.dumps(
+                        compressed_comp.get("success_count_by_profile") or {},
+                        ensure_ascii=False,
                     ),
                     "compression_success_count": compressed_comp.get("success_count"),
                     "compression_failure_count": compressed_comp.get("failure_count"),

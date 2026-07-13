@@ -2,6 +2,7 @@
 
 import threading
 import time
+import os
 from bisect import bisect_right
 from concurrent.futures import Future, ThreadPoolExecutor
 from math import sqrt
@@ -49,11 +50,36 @@ class FluxCacheManager(BaseCacheManager):
         compression_codec: str = "lossless",
         compression_rc_mode: str = "vbr",
         compression_const_qp: Optional[int] = None,
+        compression_const_qp_intra: Optional[int] = None,
+        compression_const_qp_inter_p: Optional[int] = None,
+        compression_const_qp_inter_b: Optional[int] = None,
         compression_bitrate_max_multiplier: float = 10.0,
+        compression_codec_preset: str = "p7",
+        compression_codec_tuning: str = "high_quality",
+        compression_codec_spatial_aq: Optional[int] = None,
+        compression_codec_temporal_aq: Optional[bool] = None,
+        compression_codec_target_quality: Optional[int] = None,
+        compression_quality_steps: Optional[Set[int]] = None,
+        compression_quality_bitrate: Optional[float] = None,
+        compression_quality_codec: Optional[str] = None,
+        compression_quality_rc_mode: Optional[str] = None,
+        compression_quality_const_qp: Optional[int] = None,
+        compression_quality_const_qp_intra: Optional[int] = None,
+        compression_quality_const_qp_inter_p: Optional[int] = None,
+        compression_quality_const_qp_inter_b: Optional[int] = None,
+        compression_quality_bitrate_max_multiplier: Optional[float] = None,
+        compression_quality_codec_preset: Optional[str] = None,
+        compression_quality_codec_tuning: Optional[str] = None,
+        compression_quality_codec_spatial_aq: Optional[int] = None,
+        compression_quality_codec_temporal_aq: Optional[bool] = None,
+        compression_quality_codec_target_quality: Optional[int] = None,
+        compression_quality_streams: Optional[Set[str]] = None,
         compression_gop_length: int = 1,
+        compression_gop_start_layer: int = 0,
         compression_frame_interval_p: int = 1,
         compression_quant_group_size: int = 256,
         compression_quant_outlier_ratio: float = 0.0,
+        compression_codec_residual_ratio: float = 0.0,
         compression_quant_error_probe_groups: Optional[List[int]] = None,
         compression_quant_error_probe_outlier_ratios: Optional[List[float]] = None,
         compression_quant_error_probe_max_rows: int = 0,
@@ -77,15 +103,31 @@ class FluxCacheManager(BaseCacheManager):
                 'hevc'/'h264' 使用有损视频编码
             compression_rc_mode: hevc/h264 的码率控制模式：vbr/cbr/constqp
             compression_const_qp: constqp 模式下使用的 QP；越小质量越高、压缩率越低
+            compression_const_qp_intra: constqp I 帧 QP override
+            compression_const_qp_inter_p: constqp P 帧 QP override
+            compression_const_qp_inter_b: constqp B 帧 QP override
             compression_bitrate_max_multiplier: vbr/cbr 模式 max bitrate 相对
                 average bitrate 的倍率
+            compression_codec_preset: NVENC preset p1..p7。
+            compression_codec_tuning: NVENC tuning 信息。
+            compression_codec_spatial_aq: 可选 spatial AQ strength。
+            compression_codec_temporal_aq: 可选 temporal AQ 开关。
+            compression_codec_target_quality: 可选 VBR target quality。
+            compression_quality_steps: 可选 cache step 集合；这些 step 使用
+                独立的 quality compression profile
+            compression_quality_*: quality profile 的 codec 参数；None 时
+                继承默认 compression_* 参数
             compression_gop_length: 跨连续 layer 的 GOP 长度；<=1 表示全 I 帧
+            compression_gop_start_layer: 小于该 layer 的 activation 单帧压缩；
+                从该 layer 开始建立 GOP reference frame
             compression_frame_interval_p: P 帧间隔；1 表示 IPPP
             compression_quant_group_size: lossless codec 之前 FP16->uint8
                 group-wise 量化的 group size；<=0 表示强制使用 channel-wise
                 quantization
             compression_quant_outlier_ratio: 可选异常 residual 比例；>0 时保存
                 最坏的少量量化 residual 作为辅助元数据
+            compression_codec_residual_ratio: 可选 codec 后 residual 比例；
+                >0 时在压缩后解码一次，保存最大误差的稀疏 residual
             compression_quant_error_probe_groups: 可选 qg 列表；启用后在真实
                 activation 上额外估计这些量化方案的误差，不改变实际压缩配置
             compression_quant_error_probe_outlier_ratios: 可选 residual 比例列表；
@@ -115,15 +157,114 @@ class FluxCacheManager(BaseCacheManager):
         self.compression_const_qp = (
             None if compression_const_qp is None else int(compression_const_qp)
         )
+        self.compression_const_qp_intra = (
+            None
+            if compression_const_qp_intra is None
+            else int(compression_const_qp_intra)
+        )
+        self.compression_const_qp_inter_p = (
+            None
+            if compression_const_qp_inter_p is None
+            else int(compression_const_qp_inter_p)
+        )
+        self.compression_const_qp_inter_b = (
+            None
+            if compression_const_qp_inter_b is None
+            else int(compression_const_qp_inter_b)
+        )
         self.compression_bitrate_max_multiplier = float(
             compression_bitrate_max_multiplier
         )
+        self.compression_codec_preset = str(compression_codec_preset or "p7").lower()
+        self.compression_codec_tuning = str(
+            compression_codec_tuning or "high_quality"
+        ).lower()
+        self.compression_codec_spatial_aq = (
+            None
+            if compression_codec_spatial_aq is None
+            else int(compression_codec_spatial_aq)
+        )
+        self.compression_codec_temporal_aq = compression_codec_temporal_aq
+        self.compression_codec_target_quality = (
+            None
+            if compression_codec_target_quality is None
+            else int(compression_codec_target_quality)
+        )
+        self.compression_quality_steps = {
+            int(x) for x in (compression_quality_steps or set())
+        }
+        self.compression_quality_streams = {
+            str(x).strip().lower() for x in (compression_quality_streams or set())
+            if str(x).strip()
+        }
+        self.compression_quality_bitrate = (
+            self.compression_bitrate
+            if compression_quality_bitrate is None
+            else float(compression_quality_bitrate)
+        )
+        self.compression_quality_codec = str(
+            compression_quality_codec or self.compression_codec
+        ).lower()
+        self.compression_quality_rc_mode = str(
+            compression_quality_rc_mode or self.compression_rc_mode
+        ).lower()
+        self.compression_quality_const_qp = (
+            self.compression_const_qp
+            if compression_quality_const_qp is None
+            else int(compression_quality_const_qp)
+        )
+        self.compression_quality_const_qp_intra = (
+            self.compression_const_qp_intra
+            if compression_quality_const_qp_intra is None
+            else int(compression_quality_const_qp_intra)
+        )
+        self.compression_quality_const_qp_inter_p = (
+            self.compression_const_qp_inter_p
+            if compression_quality_const_qp_inter_p is None
+            else int(compression_quality_const_qp_inter_p)
+        )
+        self.compression_quality_const_qp_inter_b = (
+            self.compression_const_qp_inter_b
+            if compression_quality_const_qp_inter_b is None
+            else int(compression_quality_const_qp_inter_b)
+        )
+        self.compression_quality_bitrate_max_multiplier = (
+            self.compression_bitrate_max_multiplier
+            if compression_quality_bitrate_max_multiplier is None
+            else float(compression_quality_bitrate_max_multiplier)
+        )
+        self.compression_quality_codec_preset = str(
+            compression_quality_codec_preset or self.compression_codec_preset
+        ).lower()
+        self.compression_quality_codec_tuning = str(
+            compression_quality_codec_tuning or self.compression_codec_tuning
+        ).lower()
+        self.compression_quality_codec_spatial_aq = (
+            self.compression_codec_spatial_aq
+            if compression_quality_codec_spatial_aq is None
+            else int(compression_quality_codec_spatial_aq)
+        )
+        self.compression_quality_codec_temporal_aq = (
+            self.compression_codec_temporal_aq
+            if compression_quality_codec_temporal_aq is None
+            else compression_quality_codec_temporal_aq
+        )
+        self.compression_quality_codec_target_quality = (
+            self.compression_codec_target_quality
+            if compression_quality_codec_target_quality is None
+            else int(compression_quality_codec_target_quality)
+        )
         self.compression_gop_length = int(compression_gop_length or 1)
+        self.compression_gop_start_layer = max(0, int(compression_gop_start_layer or 0))
         self.compression_frame_interval_p = int(compression_frame_interval_p or 1)
         self.compression_quant_group_size = int(compression_quant_group_size)
         self.compression_quant_outlier_ratio = max(
             0.0,
             float(compression_quant_outlier_ratio or 0.0),
+        )
+        self.compression_codec_residual_ratio = max(
+            0.0,
+            float(compression_codec_residual_ratio or 0.0),
         )
         self.compression_quant_error_probe_groups = (
             self._normalize_quant_error_probe_groups(
@@ -142,6 +283,7 @@ class FluxCacheManager(BaseCacheManager):
 
         # 初始化压缩器（仅在需要时）
         self.compressor = None
+        self.quality_compressor = None
         self.decompressor = None
         self._pending_compression_group: Optional[Dict[str, Any]] = None
         self._compression_current_image_key: Optional[str] = None
@@ -162,8 +304,8 @@ class FluxCacheManager(BaseCacheManager):
         self._async_compression_wait_time_s = 0.0
         self._async_compression_wait_count = 0
         self._async_compression_submit_count = 0
-        self._decoded_gop_cache: Dict[Tuple[int, str], List[Tensor]] = {}
-        self._decoded_gop_access_order: List[Tuple[int, str]] = []
+        self._decoded_gop_cache: Dict[Tuple[str, str], List[Tensor]] = {}
+        self._decoded_gop_access_order: List[Tuple[str, str]] = []
         self._decoded_gop_max_entries = 2
         # Native NVDEC from a Python worker thread can corrupt the CUDA context
         # when it overlaps with the transformer kernels. Keep GOP decoding
@@ -176,7 +318,7 @@ class FluxCacheManager(BaseCacheManager):
         self._gop_prefetch_plan: List[Dict[str, Any]] = []
         self._gop_prefetch_next_index = 0
         self._gop_prefetch_target_step: Optional[int] = None
-        self._gop_prefetch_futures: Dict[Tuple[int, str], Future] = {}
+        self._gop_prefetch_futures: Dict[Tuple[str, str], Future] = {}
         self._gop_prefetch_records: List[Dict[str, Any]] = []
         if self.use_compression:
             try:
@@ -194,7 +336,45 @@ class FluxCacheManager(BaseCacheManager):
                     quant_outlier_ratio=self.compression_quant_outlier_ratio,
                     rc_mode=self.compression_rc_mode,
                     const_qp=self.compression_const_qp,
+                    const_qp_intra=self.compression_const_qp_intra,
+                    const_qp_inter_p=self.compression_const_qp_inter_p,
+                    const_qp_inter_b=self.compression_const_qp_inter_b,
+                    codec_preset=self.compression_codec_preset,
+                    codec_tuning=self.compression_codec_tuning,
+                    codec_spatial_aq=self.compression_codec_spatial_aq,
+                    codec_temporal_aq=self.compression_codec_temporal_aq,
+                    codec_target_quality=self.compression_codec_target_quality,
                 )
+                if self.compression_quality_steps:
+                    self.quality_compressor = ActivationCompressor(
+                        bitrate=self.compression_quality_bitrate,
+                        codec=self.compression_quality_codec,
+                        bitrate_max_multiplier=(
+                            self.compression_quality_bitrate_max_multiplier
+                        ),
+                        quant_group_size=self.compression_quant_group_size,
+                        quant_outlier_ratio=self.compression_quant_outlier_ratio,
+                        rc_mode=self.compression_quality_rc_mode,
+                        const_qp=self.compression_quality_const_qp,
+                        const_qp_intra=self.compression_quality_const_qp_intra,
+                        const_qp_inter_p=(
+                            self.compression_quality_const_qp_inter_p
+                        ),
+                        const_qp_inter_b=(
+                            self.compression_quality_const_qp_inter_b
+                        ),
+                        codec_preset=self.compression_quality_codec_preset,
+                        codec_tuning=self.compression_quality_codec_tuning,
+                        codec_spatial_aq=(
+                            self.compression_quality_codec_spatial_aq
+                        ),
+                        codec_temporal_aq=(
+                            self.compression_quality_codec_temporal_aq
+                        ),
+                        codec_target_quality=(
+                            self.compression_quality_codec_target_quality
+                        ),
+                    )
                 self.decompressor = ActivationDecompressor()
                 if self.compression_gop_length > 1:
                     mode = (
@@ -204,6 +384,7 @@ class FluxCacheManager(BaseCacheManager):
                     )
                     gop_msg = (
                         f", GOP={self.compression_gop_length}, "
+                        f"gop_start_layer={self.compression_gop_start_layer}, "
                         f"frame_interval_p={self.compression_frame_interval_p}, "
                         f"{mode}"
                     )
@@ -215,6 +396,9 @@ class FluxCacheManager(BaseCacheManager):
                     codec_msg = (
                         f"{compression_codec} constqp="
                         f"{self.compression_const_qp}"
+                        f" (I={self.compression_const_qp_intra}, "
+                        f"P={self.compression_const_qp_inter_p}, "
+                        f"B={self.compression_const_qp_inter_b})"
                     )
                 else:
                     codec_msg = (
@@ -226,9 +410,29 @@ class FluxCacheManager(BaseCacheManager):
                 print(
                     f"[FluxCacheManager] Compression enabled: "
                     f"{codec_msg}{gop_msg}, "
+                    f"preset={self.compression_codec_preset}, "
+                    f"tuning={self.compression_codec_tuning}, "
+                    f"spatial_aq={self.compression_codec_spatial_aq}, "
+                    f"temporal_aq={self.compression_codec_temporal_aq}, "
+                    f"target_quality={self.compression_codec_target_quality}, "
                     f"quant_group_size={self.compression_quant_group_size}, "
-                    f"quant_outlier_ratio={self.compression_quant_outlier_ratio}"
+                    f"quant_outlier_ratio={self.compression_quant_outlier_ratio}, "
+                    f"codec_residual_ratio={self.compression_codec_residual_ratio}"
                 )
+                if self.compression_quality_steps:
+                    steps = ",".join(
+                        str(x) for x in sorted(self.compression_quality_steps)
+                    )
+                    print(
+                        "[FluxCacheManager] Quality compression profile: "
+                        f"steps={steps}, codec={self.compression_quality_codec}, "
+                        f"rc={self.compression_quality_rc_mode}, "
+                        f"const_qp={self.compression_quality_const_qp}, "
+                        f"bitrate={self.compression_quality_bitrate}, "
+                        f"preset={self.compression_quality_codec_preset}, "
+                        f"tuning={self.compression_quality_codec_tuning}, "
+                        f"streams={sorted(self.compression_quality_streams) or 'all'}"
+                    )
                 if self.compression_quant_error_probe_groups:
                     groups = ",".join(
                         "cw" if int(g) <= 0 else f"qg{int(g)}"
@@ -355,16 +559,17 @@ class FluxCacheManager(BaseCacheManager):
         """每 step 起始钩子；step==0 时进入新一轮。"""
         self._flush_pending_compression_group()
         self._drain_async_compression(wait=False)
-        keep_prefetch = self._gop_prefetch_target_step == int(step)
-        if not keep_prefetch:
+        is_round_boundary = int(step) == 0
+        keep_prefetch = (
+            (not is_round_boundary)
+            and self._gop_prefetch_target_step == int(step)
+        )
+        if is_round_boundary or not keep_prefetch:
             self._reset_gop_prefetch_state(wait=True)
             self._clear_decoded_gop_cache()
         super().on_step_start(step)
-        if step == 0:
-            self._rearranged_pe_cache = None
-            self._rearranged_pe_cache_version = -1
-            self._restore_masks = None
-            self._prev_mask_cache = None
+        if is_round_boundary or self.should_cache(self.current_step):
+            self._clear_key_token_state()
         if self._gop_prefetch_target_step == self.current_step:
             self._schedule_more_gop_prefetch()
         elif self.should_reuse(self.current_step):
@@ -856,15 +1061,55 @@ class FluxCacheManager(BaseCacheManager):
                 "original_dtype": str(tensor.dtype),
                 "source_device": str(tensor.device),
                 "cache_device": str(cache_device),
-                "codec": str(self.compression_codec),
-                "rc_mode": str(self.compression_rc_mode),
-                "const_qp": self.compression_const_qp,
-                "bitrate_max_multiplier": self.compression_bitrate_max_multiplier,
+                "compression_profile": compressed.get(
+                    "compression_profile", "default"
+                ),
+                "codec": str(compressed.get("codec", self.compression_codec)),
+                "rc_mode": str(
+                    compressed.get("rc_mode", self.compression_rc_mode)
+                ),
+                "const_qp": compressed.get("const_qp", self.compression_const_qp),
+                "const_qp_intra": compressed.get(
+                    "const_qp_intra", self.compression_const_qp_intra
+                ),
+                "const_qp_inter_p": compressed.get(
+                    "const_qp_inter_p", self.compression_const_qp_inter_p
+                ),
+                "const_qp_inter_b": compressed.get(
+                    "const_qp_inter_b", self.compression_const_qp_inter_b
+                ),
+                "bitrate_max_multiplier": compressed.get(
+                    "bitrate_max_multiplier",
+                    self.compression_bitrate_max_multiplier,
+                ),
+                "codec_preset": compressed.get(
+                    "codec_preset", self.compression_codec_preset
+                ),
+                "codec_tuning": compressed.get(
+                    "codec_tuning", self.compression_codec_tuning
+                ),
+                "codec_spatial_aq": compressed.get(
+                    "codec_spatial_aq", self.compression_codec_spatial_aq
+                ),
+                "codec_temporal_aq": compressed.get(
+                    "codec_temporal_aq", self.compression_codec_temporal_aq
+                ),
+                "codec_target_quality": compressed.get(
+                    "codec_target_quality", self.compression_codec_target_quality
+                ),
                 "quantization": compressed.get("quantization"),
                 "quantization_variant": compressed.get("quantization_variant"),
                 "quant_group_size": compressed.get("quant_group_size"),
                 "quant_outlier_ratio": compressed.get("quant_outlier_ratio", 0.0),
-                "bitrate_mbps": float(self.compression_bitrate),
+                "codec_residual_ratio": compressed.get(
+                    "codec_residual_ratio", 0.0
+                ),
+                "codec_residual_numel": compressed.get(
+                    "codec_residual_numel", 0
+                ),
+                "bitrate_mbps": float(
+                    compressed.get("bitrate_mbps", self.compression_bitrate)
+                ),
                 "compression_mode": compressed.get(
                     "compression_mode", "intra_layer"
                 ),
@@ -910,15 +1155,55 @@ class FluxCacheManager(BaseCacheManager):
                 "original_dtype": str(tensors[0].dtype),
                 "source_device": str(tensors[0].device),
                 "cache_device": str(cache_device),
-                "codec": str(self.compression_codec),
-                "rc_mode": str(self.compression_rc_mode),
-                "const_qp": self.compression_const_qp,
-                "bitrate_max_multiplier": self.compression_bitrate_max_multiplier,
+                "compression_profile": compressed.get(
+                    "compression_profile", "default"
+                ),
+                "codec": str(compressed.get("codec", self.compression_codec)),
+                "rc_mode": str(
+                    compressed.get("rc_mode", self.compression_rc_mode)
+                ),
+                "const_qp": compressed.get("const_qp", self.compression_const_qp),
+                "const_qp_intra": compressed.get(
+                    "const_qp_intra", self.compression_const_qp_intra
+                ),
+                "const_qp_inter_p": compressed.get(
+                    "const_qp_inter_p", self.compression_const_qp_inter_p
+                ),
+                "const_qp_inter_b": compressed.get(
+                    "const_qp_inter_b", self.compression_const_qp_inter_b
+                ),
+                "bitrate_max_multiplier": compressed.get(
+                    "bitrate_max_multiplier",
+                    self.compression_bitrate_max_multiplier,
+                ),
+                "codec_preset": compressed.get(
+                    "codec_preset", self.compression_codec_preset
+                ),
+                "codec_tuning": compressed.get(
+                    "codec_tuning", self.compression_codec_tuning
+                ),
+                "codec_spatial_aq": compressed.get(
+                    "codec_spatial_aq", self.compression_codec_spatial_aq
+                ),
+                "codec_temporal_aq": compressed.get(
+                    "codec_temporal_aq", self.compression_codec_temporal_aq
+                ),
+                "codec_target_quality": compressed.get(
+                    "codec_target_quality", self.compression_codec_target_quality
+                ),
                 "quantization": compressed.get("quantization"),
                 "quantization_variant": compressed.get("quantization_variant"),
                 "quant_group_size": compressed.get("quant_group_size"),
                 "quant_outlier_ratio": compressed.get("quant_outlier_ratio", 0.0),
-                "bitrate_mbps": float(self.compression_bitrate),
+                "codec_residual_ratio": compressed.get(
+                    "codec_residual_ratio", 0.0
+                ),
+                "codec_residual_numel": compressed.get(
+                    "codec_residual_numel", 0
+                ),
+                "bitrate_mbps": float(
+                    compressed.get("bitrate_mbps", self.compression_bitrate)
+                ),
                 "compression_mode": compressed.get(
                     "compression_mode", "inter_layer_gop"
                 ),
@@ -1061,6 +1346,21 @@ class FluxCacheManager(BaseCacheManager):
                     compressed_data,
                     target_device=target_device,
                 )
+            if os.environ.get("CACHEEDIT_DEBUG_FINITE") == "1":
+                with torch.no_grad():
+                    finite = bool(torch.isfinite(decompressed).all().item())
+                    if not finite:
+                        max_abs = float(
+                            decompressed.detach().float().abs().max().item()
+                        )
+                        print(
+                            "[CacheDebug] decompressed activation anomaly: "
+                            f"round={self.current_round} "
+                            f"request_step={self.current_step} "
+                            f"cache_step={cache_step} stream={stream} "
+                            f"layer={layer_idx} frame={frame_index} "
+                            f"finite={finite} max_abs={max_abs:.6g}"
+                        )
             return decompressed
         except Exception as exc:
             status = "failed"
@@ -1175,6 +1475,11 @@ class FluxCacheManager(BaseCacheManager):
         auxiliary_bytes = self._compressed_auxiliary_bytes(compressed)
         total_bytes = payload_bytes + auxiliary_bytes
         layer_indices = [int(x) for x in job["layer_indices"]]
+        compression_profile = str(
+            compressed.get("compression_profile")
+            or job.get("compression_profile")
+            or "default"
+        )
 
         self._compression_records.append(
             {
@@ -1194,15 +1499,53 @@ class FluxCacheManager(BaseCacheManager):
                     job.get("compression_devices_attempted") or []
                 ),
                 "cache_device": str(cache_device),
-                "codec": str(self.compression_codec),
-                "rc_mode": str(self.compression_rc_mode),
-                "const_qp": self.compression_const_qp,
-                "bitrate_max_multiplier": self.compression_bitrate_max_multiplier,
+                "compression_profile": compression_profile,
+                "codec": str(compressed.get("codec", self.compression_codec)),
+                "rc_mode": str(
+                    compressed.get("rc_mode", self.compression_rc_mode)
+                ),
+                "const_qp": compressed.get("const_qp", self.compression_const_qp),
+                "const_qp_intra": compressed.get(
+                    "const_qp_intra", self.compression_const_qp_intra
+                ),
+                "const_qp_inter_p": compressed.get(
+                    "const_qp_inter_p", self.compression_const_qp_inter_p
+                ),
+                "const_qp_inter_b": compressed.get(
+                    "const_qp_inter_b", self.compression_const_qp_inter_b
+                ),
+                "bitrate_max_multiplier": compressed.get(
+                    "bitrate_max_multiplier",
+                    self.compression_bitrate_max_multiplier,
+                ),
+                "codec_preset": compressed.get(
+                    "codec_preset", self.compression_codec_preset
+                ),
+                "codec_tuning": compressed.get(
+                    "codec_tuning", self.compression_codec_tuning
+                ),
+                "codec_spatial_aq": compressed.get(
+                    "codec_spatial_aq", self.compression_codec_spatial_aq
+                ),
+                "codec_temporal_aq": compressed.get(
+                    "codec_temporal_aq", self.compression_codec_temporal_aq
+                ),
+                "codec_target_quality": compressed.get(
+                    "codec_target_quality", self.compression_codec_target_quality
+                ),
                 "quantization": compressed.get("quantization"),
                 "quantization_variant": compressed.get("quantization_variant"),
                 "quant_group_size": compressed.get("quant_group_size"),
                 "quant_outlier_ratio": compressed.get("quant_outlier_ratio", 0.0),
-                "bitrate_mbps": float(self.compression_bitrate),
+                "codec_residual_ratio": compressed.get(
+                    "codec_residual_ratio", 0.0
+                ),
+                "codec_residual_numel": compressed.get(
+                    "codec_residual_numel", 0
+                ),
+                "bitrate_mbps": float(
+                    compressed.get("bitrate_mbps", self.compression_bitrate)
+                ),
                 "compression_mode": compressed.get(
                     "compression_mode", "inter_layer_gop"
                 ),
@@ -1258,6 +1601,9 @@ class FluxCacheManager(BaseCacheManager):
                     job.get("compression_devices_attempted") or []
                 ),
                 "cache_device": str(cache_device),
+                "compression_profile": str(
+                    job.get("compression_profile") or "default"
+                ),
                 "codec": str(self.compression_codec),
                 "rc_mode": str(self.compression_rc_mode),
                 "const_qp": self.compression_const_qp,
@@ -1292,13 +1638,16 @@ class FluxCacheManager(BaseCacheManager):
         try:
             last_exc: Optional[Exception] = None
             compression_devices = self._compression_device_candidates()
+            compressor = self._compressor_for_profile(
+                str(job.get("compression_profile") or "default")
+            )
             for compression_device in compression_devices:
                 attempted.append(str(compression_device))
                 try:
                     if torch.cuda.is_available() and compression_device.type == "cuda":
                         with torch.cuda.device(compression_device):
                             torch.cuda.empty_cache()
-                    compressed = self.compressor.compress_sequence(
+                    compressed = compressor.compress_sequence(
                         job["tensors"],
                         name=str(job["name"]),
                         gop_length=int(job["gop_length"]),
@@ -1306,12 +1655,27 @@ class FluxCacheManager(BaseCacheManager):
                         target_device=compression_device,
                         original_devices_override=job.get("original_devices"),
                     )
+                    compressed["compression_profile"] = str(
+                        job.get("compression_profile") or "default"
+                    )
+                    self._attach_codec_residuals(
+                        compressed,
+                        job["tensors"],
+                        target_device=compression_device,
+                    )
+                    self._validate_compressed_group_finite(
+                        compressed,
+                        target_device=compression_device,
+                        name=str(job["name"]),
+                    )
                     break
                 except Exception as exc:
                     last_exc = exc
                     self._clear_compression_pipeline_caches()
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
+                    if "validation decoded non-finite activation" in str(exc):
+                        raise
             else:
                 assert last_exc is not None
                 raise last_exc
@@ -1337,6 +1701,98 @@ class FluxCacheManager(BaseCacheManager):
                 "queue_delay_s": start_s - float(job["submitted_at"]),
                 "error": exc,
             }
+
+    def _attach_codec_residuals(
+        self,
+        compressed: Dict[str, Any],
+        tensors: List[Tensor],
+        *,
+        target_device: torch.device,
+    ) -> None:
+        ratio = float(self.compression_codec_residual_ratio or 0.0)
+        if ratio <= 0.0:
+            return
+        if self.decompressor is None:
+            return
+
+        frame_count = int(compressed.get("frame_count", len(tensors)) or len(tensors))
+        if frame_count != len(tensors):
+            return
+
+        residual_indices: List[Tensor] = []
+        residual_values: List[Tensor] = []
+        residual_numel = 0
+        t0 = time.time()
+        decoded_frames = self.decompressor.decompress_sequence(
+            compressed,
+            target_device=target_device,
+        )
+        try:
+            for original, restored in zip(tensors, decoded_frames):
+                original_on_device = original.to(device=target_device)
+                error = (
+                    original_on_device.float().reshape(-1)
+                    - restored.float().reshape(-1)
+                )
+                numel = int(error.numel())
+                k = int(numel * ratio)
+                if k <= 0:
+                    residual_indices.append(torch.empty(0, dtype=torch.int32))
+                    residual_values.append(torch.empty(0, dtype=torch.float16))
+                    continue
+                k = min(k, numel)
+                _, indices = torch.topk(error.abs(), k, sorted=False)
+                values = error.index_select(0, indices).to(torch.float16)
+                residual_indices.append(indices.to("cpu", dtype=torch.int32))
+                residual_values.append(values.to("cpu"))
+                residual_numel += int(k)
+                del original_on_device, error, indices, values
+        finally:
+            del decoded_frames
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        compressed["codec_residual_ratio"] = ratio
+        compressed["codec_residual_indices"] = residual_indices
+        compressed["codec_residual_values"] = residual_values
+        compressed["codec_residual_numel"] = int(residual_numel)
+        compressed["codec_residual_value_dtype"] = "float16"
+        compressed["codec_residual_build_time_s"] = float(time.time() - t0)
+
+    def _validate_compressed_group_finite(
+        self,
+        compressed: Dict[str, Any],
+        *,
+        target_device: torch.device,
+        name: str,
+    ) -> None:
+        if os.environ.get("CACHEEDIT_VALIDATE_COMPRESSED_CACHE", "1") == "0":
+            return
+        if self.decompressor is None:
+            return
+        if compressed.get("compression_mode") != "inter_layer_gop":
+            return
+        if hasattr(self.decompressor, "validate_sequence_finite"):
+            self.decompressor.validate_sequence_finite(
+                compressed,
+                target_device=target_device,
+            )
+            return
+        frames = self.decompressor.decompress_sequence(
+            compressed,
+            target_device=target_device,
+        )
+        try:
+            for frame_index, frame in enumerate(frames):
+                if not torch.isfinite(frame).all().item():
+                    raise RuntimeError(
+                        f"validation decoded non-finite activation for "
+                        f"{name} frame={frame_index}"
+                    )
+        finally:
+            del frames
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     def _set_resolved_cache_value(
         self,
@@ -1380,6 +1836,12 @@ class FluxCacheManager(BaseCacheManager):
                 compressed,
                 target_device,
             )
+            if isinstance(compressed_on_device, dict):
+                compressed_on_device["_cacheedit_uid"] = (
+                    f"{job.get('image_key')}:{int(job['round'])}:"
+                    f"{step}:{stream}:{layer_indices[0]}-"
+                    f"{layer_indices[-1]}:{job_id}"
+                )
             self._record_async_compression_group_success(
                 job=job,
                 compressed=compressed,
@@ -1509,13 +1971,20 @@ class FluxCacheManager(BaseCacheManager):
             return "__original_devices__"
         return str(torch.device(target_device))
 
+    @staticmethod
+    def _decoded_gop_payload_key(compressed_data: Dict[str, Any]) -> str:
+        uid = compressed_data.get("_cacheedit_uid")
+        if uid is not None:
+            return str(uid)
+        return f"id:{id(compressed_data)}"
+
     def _clear_decoded_gop_cache(self) -> None:
         with self._gop_prefetch_lock:
             self._decoded_gop_cache.clear()
             self._decoded_gop_access_order.clear()
 
     def _clear_compression_pipeline_caches(self) -> None:
-        for component in (self.compressor, self.decompressor):
+        for component in (self.compressor, self.quality_compressor, self.decompressor):
             if component is not None and hasattr(component, "clear_pipeline_cache"):
                 component.clear_pipeline_cache()
 
@@ -1641,8 +2110,9 @@ class FluxCacheManager(BaseCacheManager):
             plan_item = self._gop_prefetch_plan[self._gop_prefetch_next_index]
             self._gop_prefetch_next_index += 1
             compressed_data = plan_item["compressed_data"]
+            payload_key = self._decoded_gop_payload_key(compressed_data)
             cache_key = (
-                id(compressed_data),
+                payload_key,
                 self._decoded_gop_device_key(None),
             )
             if (
@@ -1852,12 +2322,13 @@ class FluxCacheManager(BaseCacheManager):
         target_device_obj = (
             torch.device(target_device) if target_device is not None else None
         )
+        payload_key = self._decoded_gop_payload_key(compressed_data)
         cache_key = (
-            id(compressed_data),
+            payload_key,
             self._decoded_gop_device_key(target_device_obj),
         )
         canonical_key = (
-            id(compressed_data),
+            payload_key,
             self._decoded_gop_device_key(None),
         )
 
@@ -1964,6 +2435,25 @@ class FluxCacheManager(BaseCacheManager):
         # without increasing NVENC/GPU memory pressure.
         self.new_key_ref_cache[key] = tensor.detach().to("cpu", copy=True)
 
+    def _compression_profile_for(self, step: int, stream: StreamType) -> str:
+        if int(step) not in self.compression_quality_steps:
+            return "default"
+        if self.compression_quality_streams:
+            stream_name = str(stream).strip().lower()
+            if stream_name not in self.compression_quality_streams:
+                return "default"
+        return "quality"
+
+    def _compression_profile_for_step(self, step: int) -> str:
+        if int(step) in self.compression_quality_steps and not self.compression_quality_streams:
+            return "quality"
+        return "default"
+
+    def _compressor_for_profile(self, profile: str):
+        if profile == "quality" and self.quality_compressor is not None:
+            return self.quality_compressor
+        return self.compressor
+
     def _compress_and_store_single(
         self,
         stream: StreamType,
@@ -1974,6 +2464,8 @@ class FluxCacheManager(BaseCacheManager):
     ) -> None:
         key = (stream, self.current_step, layer_idx)
         t0 = time.time()
+        profile = self._compression_profile_for(int(self.current_step), stream)
+        compressor = self._compressor_for_profile(profile)
         try:
             self._record_quant_error_probe_group(
                 stream=stream,
@@ -1981,10 +2473,11 @@ class FluxCacheManager(BaseCacheManager):
                 layer_indices=[int(layer_idx)],
                 tensors=[tensor.detach()],
             )
-            compressed = self.compressor.compress(
+            compressed = compressor.compress(
                 tensor,
                 name=f"step{self.current_step}_layer{layer_idx}",
             )
+            compressed["compression_profile"] = profile
             elapsed_s = time.time() - t0
             extra_bytes = int(compressed.get("code_size", 0) or 0)
             target_device = (
@@ -2069,6 +2562,16 @@ class FluxCacheManager(BaseCacheManager):
         *,
         smart_device: bool,
     ) -> None:
+        if int(layer_idx) < self.compression_gop_start_layer:
+            self._flush_pending_compression_group()
+            self._compress_and_store_single(
+                stream,
+                layer_idx,
+                tensor,
+                smart_device=smart_device,
+            )
+            return
+
         if not self._pending_group_matches(
             stream,
             layer_idx,
@@ -2149,6 +2652,7 @@ class FluxCacheManager(BaseCacheManager):
             "frame_count": len(tensors),
             "gop_length": min(self.compression_gop_length, len(tensors)),
             "frame_interval_p": self.compression_frame_interval_p,
+            "compression_profile": self._compression_profile_for(step, stream),
             "name": (
                 f"step{step}_{stream}_layers"
                 f"{layer_indices[0]}-{layer_indices[-1]}"
@@ -2597,6 +3101,15 @@ class FluxCacheManager(BaseCacheManager):
         self._rearranged_pe_cache = None
         self._rearranged_pe_cache_version = -1
 
+    def _clear_key_token_state(self) -> None:
+        """清空只在一个 cache-step 分组内有效的 key-token 状态。"""
+        self.key_token_indices = None
+        self._key_indices_version += 1
+        self._rearranged_pe_cache = None
+        self._rearranged_pe_cache_version = -1
+        self._restore_masks = None
+        self._prev_mask_cache = None
+
     def _rearrange_img_only(self, img: Tensor) -> Tensor:
         """只重排 img（PE 已缓存场景下使用）。"""
         key_token_indices = self.key_token_indices
@@ -2820,9 +3333,12 @@ class FluxCacheManager(BaseCacheManager):
             )
         )
         by_mode: Dict[str, int] = {}
+        by_profile: Dict[str, int] = {}
         by_quantization: Dict[str, int] = {}
         by_quantization_variant: Dict[str, int] = {}
         for record in success_records:
+            profile = str(record.get("compression_profile") or "default")
+            by_profile[profile] = by_profile.get(profile, 0) + 1
             mode = str(record.get("compression_mode", "intra_layer"))
             by_mode[mode] = by_mode.get(mode, 0) + 1
             quantization = str(record.get("quantization") or "unknown")
@@ -2914,11 +3430,39 @@ class FluxCacheManager(BaseCacheManager):
             "bitrate_mbps": float(self.compression_bitrate),
             "rc_mode": str(self.compression_rc_mode),
             "const_qp": self.compression_const_qp,
+            "const_qp_intra": self.compression_const_qp_intra,
+            "const_qp_inter_p": self.compression_const_qp_inter_p,
+            "const_qp_inter_b": self.compression_const_qp_inter_b,
             "bitrate_max_multiplier": self.compression_bitrate_max_multiplier,
+            "codec_preset": self.compression_codec_preset,
+            "codec_tuning": self.compression_codec_tuning,
+            "codec_spatial_aq": self.compression_codec_spatial_aq,
+            "codec_temporal_aq": self.compression_codec_temporal_aq,
+            "codec_target_quality": self.compression_codec_target_quality,
+            "quality_steps": sorted(int(x) for x in self.compression_quality_steps),
+            "quality_streams": sorted(str(x) for x in self.compression_quality_streams),
+            "quality_codec": self.compression_quality_codec,
+            "quality_bitrate_mbps": float(self.compression_quality_bitrate),
+            "quality_rc_mode": self.compression_quality_rc_mode,
+            "quality_const_qp": self.compression_quality_const_qp,
+            "quality_const_qp_intra": self.compression_quality_const_qp_intra,
+            "quality_const_qp_inter_p": self.compression_quality_const_qp_inter_p,
+            "quality_const_qp_inter_b": self.compression_quality_const_qp_inter_b,
+            "quality_bitrate_max_multiplier": (
+                self.compression_quality_bitrate_max_multiplier
+            ),
+            "quality_codec_preset": self.compression_quality_codec_preset,
+            "quality_codec_tuning": self.compression_quality_codec_tuning,
+            "quality_codec_spatial_aq": self.compression_quality_codec_spatial_aq,
+            "quality_codec_temporal_aq": self.compression_quality_codec_temporal_aq,
+            "quality_codec_target_quality": self.compression_quality_codec_target_quality,
             "quant_group_size": int(self.compression_quant_group_size),
             "quant_outlier_ratio": float(self.compression_quant_outlier_ratio),
+            "codec_residual_ratio": float(self.compression_codec_residual_ratio),
             "configured_gop_length": int(self.compression_gop_length),
+            "configured_gop_start_layer": int(self.compression_gop_start_layer),
             "configured_frame_interval_p": int(self.compression_frame_interval_p),
+            "success_count_by_profile": by_profile,
             "success_count_by_mode": by_mode,
             "success_count_by_quantization": by_quantization,
             "success_count_by_quantization_variant": by_quantization_variant,
