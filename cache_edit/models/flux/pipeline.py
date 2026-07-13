@@ -1,6 +1,6 @@
 """Flux Kontext pipeline with caching support."""
 
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -552,11 +552,36 @@ def create_default_cache_manager(
     compression_codec: str = "lossless",
     compression_rc_mode: str = "vbr",
     compression_const_qp: Optional[int] = None,
+    compression_const_qp_intra: Optional[int] = None,
+    compression_const_qp_inter_p: Optional[int] = None,
+    compression_const_qp_inter_b: Optional[int] = None,
     compression_bitrate_max_multiplier: float = 10.0,
+    compression_codec_preset: str = "p7",
+    compression_codec_tuning: str = "high_quality",
+    compression_codec_spatial_aq: Optional[int] = None,
+    compression_codec_temporal_aq: Optional[bool] = None,
+    compression_codec_target_quality: Optional[int] = None,
+    compression_quality_steps: Optional[Set[int]] = None,
+    compression_quality_bitrate: Optional[float] = None,
+    compression_quality_codec: Optional[str] = None,
+    compression_quality_rc_mode: Optional[str] = None,
+    compression_quality_const_qp: Optional[int] = None,
+    compression_quality_const_qp_intra: Optional[int] = None,
+    compression_quality_const_qp_inter_p: Optional[int] = None,
+    compression_quality_const_qp_inter_b: Optional[int] = None,
+    compression_quality_bitrate_max_multiplier: Optional[float] = None,
+    compression_quality_codec_preset: Optional[str] = None,
+    compression_quality_codec_tuning: Optional[str] = None,
+    compression_quality_codec_spatial_aq: Optional[int] = None,
+    compression_quality_codec_temporal_aq: Optional[bool] = None,
+    compression_quality_codec_target_quality: Optional[int] = None,
+    compression_quality_streams: Optional[Set[str]] = None,
     compression_gop_length: int = 1,
+    compression_gop_start_layer: int = 0,
     compression_frame_interval_p: int = 1,
     compression_quant_group_size: int = 256,
     compression_quant_outlier_ratio: float = 0.0,
+    compression_codec_residual_ratio: float = 0.0,
     compression_quant_error_probe_groups: Optional[List[int]] = None,
     compression_quant_error_probe_outlier_ratios: Optional[List[float]] = None,
     compression_quant_error_probe_max_rows: int = 0,
@@ -580,15 +605,31 @@ def create_default_cache_manager(
             'hevc'/'h264' 为有损视频编解码器
         compression_rc_mode: hevc/h264 的码率控制模式：vbr/cbr/constqp
         compression_const_qp: constqp 模式的 QP；越小质量越高、压缩率越低
+        compression_const_qp_intra: constqp I 帧 QP override
+        compression_const_qp_inter_p: constqp P 帧 QP override
+        compression_const_qp_inter_b: constqp B 帧 QP override
         compression_bitrate_max_multiplier: vbr/cbr 模式 max bitrate 相对
             average bitrate 的倍率
+        compression_codec_preset: NVENC preset p1..p7
+        compression_codec_tuning: NVENC tuning: high_quality / low_latency /
+            ultra_low_latency
+        compression_codec_spatial_aq: 可选 spatial AQ strength
+        compression_codec_temporal_aq: 可选 temporal AQ 开关
+        compression_codec_target_quality: 可选 VBR target quality
+        compression_quality_steps: 使用独立 quality profile 的 cache step 集合
+        compression_quality_*: quality profile codec 参数；None 时继承默认参数
+        compression_quality_streams: 可选 stream 集合；非空时 quality profile
+            只应用到匹配 stream 的 cache group
         compression_gop_length: 连续 layer 帧间压缩 GOP 长度；<=1 表示全 I 帧
+        compression_gop_start_layer: 小于该 layer 的 activation 单帧压缩；
+            从该 layer 开始建立 GOP reference frame
         compression_frame_interval_p: P 帧间隔；1 表示 IPPP
         compression_quant_group_size: lossless codec 之前 FP16->uint8 的
             group-wise 量化 group size；<=0 表示强制使用 channel-wise
             quantization
         compression_quant_outlier_ratio: 可选异常 residual 比例；>0 时保存
             最坏的少量量化 residual 作为辅助元数据
+        compression_codec_residual_ratio: codec 后 top-k residual 比例
         compression_quant_error_probe_groups: 可选 qg 列表；启用后在真实
             activation 上记录不同量化方案的误差
         compression_quant_error_probe_outlier_ratios: 可选 residual 比例列表；
@@ -615,11 +656,40 @@ def create_default_cache_manager(
         compression_codec=compression_codec,
         compression_rc_mode=compression_rc_mode,
         compression_const_qp=compression_const_qp,
+        compression_const_qp_intra=compression_const_qp_intra,
+        compression_const_qp_inter_p=compression_const_qp_inter_p,
+        compression_const_qp_inter_b=compression_const_qp_inter_b,
         compression_bitrate_max_multiplier=compression_bitrate_max_multiplier,
+        compression_codec_preset=compression_codec_preset,
+        compression_codec_tuning=compression_codec_tuning,
+        compression_codec_spatial_aq=compression_codec_spatial_aq,
+        compression_codec_temporal_aq=compression_codec_temporal_aq,
+        compression_codec_target_quality=compression_codec_target_quality,
+        compression_quality_steps=compression_quality_steps,
+        compression_quality_bitrate=compression_quality_bitrate,
+        compression_quality_codec=compression_quality_codec,
+        compression_quality_rc_mode=compression_quality_rc_mode,
+        compression_quality_const_qp=compression_quality_const_qp,
+        compression_quality_const_qp_intra=compression_quality_const_qp_intra,
+        compression_quality_const_qp_inter_p=compression_quality_const_qp_inter_p,
+        compression_quality_const_qp_inter_b=compression_quality_const_qp_inter_b,
+        compression_quality_bitrate_max_multiplier=(
+            compression_quality_bitrate_max_multiplier
+        ),
+        compression_quality_codec_preset=compression_quality_codec_preset,
+        compression_quality_codec_tuning=compression_quality_codec_tuning,
+        compression_quality_codec_spatial_aq=compression_quality_codec_spatial_aq,
+        compression_quality_codec_temporal_aq=compression_quality_codec_temporal_aq,
+        compression_quality_codec_target_quality=(
+            compression_quality_codec_target_quality
+        ),
+        compression_quality_streams=compression_quality_streams,
         compression_gop_length=compression_gop_length,
+        compression_gop_start_layer=compression_gop_start_layer,
         compression_frame_interval_p=compression_frame_interval_p,
         compression_quant_group_size=compression_quant_group_size,
         compression_quant_outlier_ratio=compression_quant_outlier_ratio,
+        compression_codec_residual_ratio=compression_codec_residual_ratio,
         compression_quant_error_probe_groups=compression_quant_error_probe_groups,
         compression_quant_error_probe_outlier_ratios=(
             compression_quant_error_probe_outlier_ratios

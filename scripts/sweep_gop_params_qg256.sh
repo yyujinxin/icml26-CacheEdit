@@ -62,17 +62,17 @@ COMPRESSION_BITRATE="5.0"
 COMPRESSION_QUANT_GROUP_SIZE="256"
 
 # GOP:P pairs to test. GOP length controls how many consecutive layers are
-# encoded together. frame_interval_p controls prediction structure:
-# 1=IPPP, 2=IBPBP, 3=IBBPBBP, larger values add more B frames.
+# encoded together. frame_interval_p=1 means IPPP..., so every non-I frame is a
+# P frame and no B frames are used. Longer GOPs increase the number of P frames
+# per codec group.
 # gop1/gop4/gop8 were measured as too slow on reuse rounds because they create
 # too many small codec groups, so they are intentionally excluded by default.
-# Keep existing completed gop16 rows for comparison and explore longer GOPs.
 GOP_CONFIGS=(
     "16:1"
-    "16:2"
+    "24:1"
     "32:1"
-    "32:4"
-    "32:16"
+    "48:1"
+    "57:1"
 )
 
 # Set to 1 to rerun baseline and cache-only. Set to 0 to reuse existing outputs.

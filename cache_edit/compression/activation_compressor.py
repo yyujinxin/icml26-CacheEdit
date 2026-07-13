@@ -195,6 +195,14 @@ class ActivationCompressor:
         quant_outlier_ratio: float = 0.0,
         rc_mode: str = "vbr",
         const_qp: Optional[int] = None,
+        const_qp_intra: Optional[int] = None,
+        const_qp_inter_p: Optional[int] = None,
+        const_qp_inter_b: Optional[int] = None,
+        codec_preset: str = "p7",
+        codec_tuning: str = "high_quality",
+        codec_spatial_aq: Optional[int] = None,
+        codec_temporal_aq: Optional[bool] = None,
+        codec_target_quality: Optional[int] = None,
     ):
         """
         Args:
@@ -211,6 +219,15 @@ class ActivationCompressor:
                 residuals to store exactly beside the codec payload.
             rc_mode: Rate-control mode for hevc/h264: vbr, cbr, or constqp.
             const_qp: Constant QP value used when rc_mode=constqp.
+            const_qp_intra: Optional I-frame QP override for constqp mode.
+            const_qp_inter_p: Optional P-frame QP override for constqp mode.
+            const_qp_inter_b: Optional B-frame QP override for constqp mode.
+            codec_preset: NVENC preset p1..p7. p7 is highest quality/slowest.
+            codec_tuning: NVENC tuning: high_quality, low_latency,
+                ultra_low_latency.
+            codec_spatial_aq: Optional NVENC spatial AQ strength.
+            codec_temporal_aq: Optional NVENC temporal AQ toggle.
+            codec_target_quality: Optional NVENC VBR target quality value.
         """
         codec = str(codec).lower()
         if not NVENC_AVAILABLE:
@@ -231,6 +248,24 @@ class ActivationCompressor:
             self.const_qp = 28 if const_qp is None else int(const_qp)
         else:
             self.const_qp = None if const_qp is None else int(const_qp)
+        self.const_qp_intra = (
+            None if const_qp_intra is None else int(const_qp_intra)
+        )
+        self.const_qp_inter_p = (
+            None if const_qp_inter_p is None else int(const_qp_inter_p)
+        )
+        self.const_qp_inter_b = (
+            None if const_qp_inter_b is None else int(const_qp_inter_b)
+        )
+        self.codec_preset = str(codec_preset or "p7").lower()
+        self.codec_tuning = str(codec_tuning or "high_quality").lower()
+        self.codec_spatial_aq = (
+            None if codec_spatial_aq is None else int(codec_spatial_aq)
+        )
+        self.codec_temporal_aq = codec_temporal_aq
+        self.codec_target_quality = (
+            None if codec_target_quality is None else int(codec_target_quality)
+        )
 
         # Cache pipelines per GPU: {gpu_id: {shape_key: pipeline}}
         self._pipeline_cache_per_gpu = {}
@@ -243,6 +278,13 @@ class ActivationCompressor:
             f"codec={codec}, quant_group_size={self.quant_group_size}, "
             f"quant_outlier_ratio={self.quant_outlier_ratio}, "
             f"rc_mode={self.rc_mode}, const_qp={self.const_qp}, "
+            f"const_qp_intra={self.const_qp_intra}, "
+            f"const_qp_inter_p={self.const_qp_inter_p}, "
+            f"const_qp_inter_b={self.const_qp_inter_b}, "
+            f"preset={self.codec_preset}, tuning={self.codec_tuning}, "
+            f"spatial_aq={self.codec_spatial_aq}, "
+            f"temporal_aq={self.codec_temporal_aq}, "
+            f"target_quality={self.codec_target_quality}, "
             f"max_pipelines={max_cached_pipelines} per GPU"
         )
 
@@ -276,9 +318,22 @@ class ActivationCompressor:
         else:
             if self.rc_mode == "constqp":
                 qp = EncodeQp()
-                qp.qpInterP = int(self.const_qp if self.const_qp is not None else 28)
-                qp.qpInterB = int(self.const_qp if self.const_qp is not None else 28)
-                qp.qpIntra = int(self.const_qp if self.const_qp is not None else 28)
+                base_qp = int(self.const_qp if self.const_qp is not None else 28)
+                qp.qpInterP = int(
+                    self.const_qp_inter_p
+                    if self.const_qp_inter_p is not None
+                    else base_qp
+                )
+                qp.qpInterB = int(
+                    self.const_qp_inter_b
+                    if self.const_qp_inter_b is not None
+                    else base_qp
+                )
+                qp.qpIntra = int(
+                    self.const_qp_intra
+                    if self.const_qp_intra is not None
+                    else base_qp
+                )
                 config.rc_mode = RateControlMode.ConstQP
                 config.const_qp = qp
             elif self.rc_mode == "cbr":
@@ -292,9 +347,15 @@ class ActivationCompressor:
                 config.max_bit_rate = int(
                     self.bitrate * 1000000 * self.bitrate_max_multiplier
                 )
+                if self.codec_target_quality is not None:
+                    config.target_quality = int(self.codec_target_quality)
                 config.rc_mode = RateControlMode.VBR
-            config.preset = PresetType.P7
-            config.tuning_info = TuningInfo.HighQuality
+            config.preset = self._preset_type(self.codec_preset)
+            config.tuning_info = self._tuning_info(self.codec_tuning)
+            if self.codec_spatial_aq is not None:
+                config.spatial_aq = int(self.codec_spatial_aq)
+            if self.codec_temporal_aq is not None:
+                config.temporal_aq = bool(self.codec_temporal_aq)
         config.monochrome = True
 
         if gop_length is not None and gop_length > 1:
@@ -304,6 +365,37 @@ class ActivationCompressor:
             config.gop_length = None
             config.frame_interval_p = None
         return config
+
+    @staticmethod
+    def _preset_type(value: str):
+        table = {
+            "p1": PresetType.P1,
+            "p2": PresetType.P2,
+            "p3": PresetType.P3,
+            "p4": PresetType.P4,
+            "p5": PresetType.P5,
+            "p6": PresetType.P6,
+            "p7": PresetType.P7,
+        }
+        key = str(value or "p7").lower()
+        if key not in table:
+            raise ValueError(f"Unsupported NVENC preset: {value}")
+        return table[key]
+
+    @staticmethod
+    def _tuning_info(value: str):
+        table = {
+            "high_quality": TuningInfo.HighQuality,
+            "hq": TuningInfo.HighQuality,
+            "low_latency": TuningInfo.LowLatency,
+            "ll": TuningInfo.LowLatency,
+            "ultra_low_latency": TuningInfo.UltraLowLatency,
+            "ull": TuningInfo.UltraLowLatency,
+        }
+        key = str(value or "high_quality").lower()
+        if key not in table:
+            raise ValueError(f"Unsupported NVENC tuning: {value}")
+        return table[key]
 
     def _create_pipeline(self, height: int, width: int) -> Pipeline:
         """Create all-I compression pipeline for one activation tensor."""
@@ -523,12 +615,13 @@ class ActivationCompressor:
 
         height, width = activation_2d.shape
 
-        # Ensure activation is on GPU and FP16
+        # Ensure activation is on GPU. Do not force bf16/fp32 activations to
+        # fp16 here: Flux runs in bf16 and some activations exceed fp16 range.
+        # The quantization step converts to fp32 before min/max, then emits
+        # uint8 frames for the codec.
         original_device = activation_2d.device
         if activation_2d.device.type != 'cuda':
             activation_2d = activation_2d.cuda()
-        if activation_2d.dtype != torch.float16:
-            activation_2d = activation_2d.to(torch.float16)
 
         # Compress - pipeline.forward() expects a tensor directly
         try:
@@ -551,6 +644,20 @@ class ActivationCompressor:
             compressed_dict['original_device'] = original_device
             compressed_dict['compression_mode'] = 'intra_layer'
             compressed_dict['codec'] = self.codec
+            compressed_dict['rc_mode'] = self.rc_mode
+            compressed_dict['const_qp'] = self.const_qp
+            compressed_dict['const_qp_intra'] = self.const_qp_intra
+            compressed_dict['const_qp_inter_p'] = self.const_qp_inter_p
+            compressed_dict['const_qp_inter_b'] = self.const_qp_inter_b
+            compressed_dict['bitrate_mbps'] = float(self.bitrate)
+            compressed_dict['bitrate_max_multiplier'] = float(
+                self.bitrate_max_multiplier
+            )
+            compressed_dict['codec_preset'] = self.codec_preset
+            compressed_dict['codec_tuning'] = self.codec_tuning
+            compressed_dict['codec_spatial_aq'] = self.codec_spatial_aq
+            compressed_dict['codec_temporal_aq'] = self.codec_temporal_aq
+            compressed_dict['codec_target_quality'] = self.codec_target_quality
             compressed_dict['quantization'] = _quantization_name(
                 self.codec,
                 width,
@@ -623,7 +730,7 @@ class ActivationCompressor:
 
         sequence = torch.stack(
             [
-                tensor.to(device=target_device, dtype=torch.float16)
+                tensor.to(device=target_device)
                 for tensor in tensors_2d
             ],
             dim=0,
@@ -649,6 +756,20 @@ class ActivationCompressor:
             effective_gop = min(int(gop_length or len(activations)), len(activations))
             compressed_dict["compression_mode"] = "inter_layer_gop"
             compressed_dict["codec"] = self.codec
+            compressed_dict["rc_mode"] = self.rc_mode
+            compressed_dict["const_qp"] = self.const_qp
+            compressed_dict["const_qp_intra"] = self.const_qp_intra
+            compressed_dict["const_qp_inter_p"] = self.const_qp_inter_p
+            compressed_dict["const_qp_inter_b"] = self.const_qp_inter_b
+            compressed_dict["bitrate_mbps"] = float(self.bitrate)
+            compressed_dict["bitrate_max_multiplier"] = float(
+                self.bitrate_max_multiplier
+            )
+            compressed_dict["codec_preset"] = self.codec_preset
+            compressed_dict["codec_tuning"] = self.codec_tuning
+            compressed_dict["codec_spatial_aq"] = self.codec_spatial_aq
+            compressed_dict["codec_temporal_aq"] = self.codec_temporal_aq
+            compressed_dict["codec_target_quality"] = self.codec_target_quality
             compressed_dict["quantization"] = _quantization_name(
                 self.codec,
                 width,
@@ -707,6 +828,37 @@ class ActivationDecompressor:
         self._sequence_pipeline_access_order_per_gpu = {}
 
         logger.info(f"[ActivationDecompressor] Initialized with max_pipelines={max_cached_pipelines} per GPU")
+
+    @staticmethod
+    def _apply_codec_residual(
+        compressed_dict: Dict[str, Any],
+        recovered: torch.Tensor,
+        frame_index: Optional[int] = None,
+    ) -> torch.Tensor:
+        indices_list = compressed_dict.get("codec_residual_indices")
+        values_list = compressed_dict.get("codec_residual_values")
+        if indices_list is None or values_list is None:
+            return recovered
+
+        if frame_index is None:
+            indices = indices_list
+            values = values_list
+        else:
+            if frame_index >= len(indices_list) or frame_index >= len(values_list):
+                return recovered
+            indices = indices_list[frame_index]
+            values = values_list[frame_index]
+
+        if not isinstance(indices, torch.Tensor) or not isinstance(values, torch.Tensor):
+            return recovered
+        if indices.numel() == 0 or values.numel() == 0:
+            return recovered
+
+        flat = recovered.reshape(-1)
+        indices = indices.to(device=flat.device, dtype=torch.long)
+        values = values.to(device=flat.device, dtype=torch.float32)
+        updated = flat.index_add(0, indices, values.to(dtype=flat.dtype))
+        return updated.reshape_as(recovered)
 
     def clear_pipeline_cache(self) -> None:
         """Drop cached pipeline objects so native NVDEC resources can be freed."""
@@ -1050,6 +1202,7 @@ class ActivationDecompressor:
                 recovered = recovered.to(original_dtype)
             if recovered.device != target_device:
                 recovered = recovered.to(target_device)
+            recovered = self._apply_codec_residual(compressed_dict, recovered)
 
             logger.debug(f"[Decompress] Restored shape: {recovered.shape}")
 
@@ -1210,11 +1363,155 @@ class ActivationDecompressor:
                         recovered = recovered.to(original_dtype)
                     if recovered.device != frame_target_device:
                         recovered = recovered.to(frame_target_device)
+                    recovered = self._apply_codec_residual(
+                        compressed_dict,
+                        recovered,
+                        frame_index=frame_index,
+                    )
                     recovered_frames.append(recovered)
 
             return recovered_frames
         except Exception as e:
             logger.error(f"[Decompress] Failed for GOP sequence: {e}")
+            raise
+
+    def validate_sequence_finite(
+        self,
+        compressed_dict: Dict[str, Any],
+        target_device: Optional[torch.device] = None,
+    ) -> None:
+        """Decode a GOP once and check each restored frame without retaining it."""
+        if not NVENC_AVAILABLE:
+            raise RuntimeError("NVENC not available")
+
+        original_shapes = compressed_dict["original_shapes"]
+        original_devices = compressed_dict["original_devices"]
+        frame_count = int(compressed_dict["frame_count"])
+        if len(original_shapes) != frame_count:
+            raise ValueError(
+                f"original_shapes has {len(original_shapes)} entries, "
+                f"expected frame_count={frame_count}"
+            )
+
+        first_shape = original_shapes[0]
+        if len(first_shape) == 3:
+            batch, seq_len, hidden_dim = first_shape
+            height = batch * seq_len
+            width = hidden_dim
+        elif len(first_shape) == 2:
+            height, width = first_shape
+        else:
+            raise ValueError(f"Unsupported shape: {first_shape}")
+
+        padded_height = ((height + self.tile_height - 1) // self.tile_height) * self.tile_height
+        padded_width = ((width + self.tile_width - 1) // self.tile_width) * self.tile_width
+
+        decode_device = target_device
+        if decode_device is None:
+            decode_device = next(
+                (
+                    device
+                    for device in original_devices
+                    if getattr(device, "type", None) == "cuda"
+                ),
+                original_devices[0],
+            )
+        if not isinstance(decode_device, torch.device):
+            decode_device = torch.device(decode_device)
+
+        try:
+            device_ctx = (
+                torch.cuda.device(decode_device)
+                if decode_device.type == "cuda"
+                else nullcontext()
+            )
+            with device_ctx:
+                sequence_pipeline = self._get_sequence_pipeline(
+                    height,
+                    width,
+                    frame_count,
+                    decode_device,
+                    codec=compressed_dict.get("codec", "hevc"),
+                    quant_group_size=compressed_dict.get(
+                        "quant_group_size", DEFAULT_LOSSLESS_QUANT_GROUP_SIZE
+                    ),
+                    quant_outlier_ratio=compressed_dict.get(
+                        "quant_outlier_ratio", 0.0
+                    ),
+                )
+                single_pipeline = self._get_pipeline(
+                    height,
+                    width,
+                    decode_device,
+                    codec=compressed_dict.get("codec", "hevc"),
+                    quant_group_size=compressed_dict.get(
+                        "quant_group_size", DEFAULT_LOSSLESS_QUANT_GROUP_SIZE
+                    ),
+                    quant_outlier_ratio=compressed_dict.get(
+                        "quant_outlier_ratio", 0.0
+                    ),
+                )
+
+                data_dict = compressed_dict.copy()
+                data_dict = _move_compressed_value(data_dict, decode_device)
+                decoded_dict = sequence_pipeline.steps[-1].backward(data_dict)
+                decoded_tiles = decoded_dict["data"]
+                tiles_shape = decoded_dict["tiles_shape"]
+                scale = decoded_dict["scale"]
+                offset = decoded_dict["offset"]
+
+                rows_per_frame = _quantization_rows_per_frame(
+                    compressed_dict.get("quantization"),
+                    height,
+                    width,
+                )
+                group_size = int(
+                    compressed_dict.get(
+                        "quant_group_size",
+                        DEFAULT_LOSSLESS_QUANT_GROUP_SIZE,
+                    )
+                    or DEFAULT_LOSSLESS_QUANT_GROUP_SIZE
+                )
+
+                for frame_index in range(frame_count):
+                    frame_dict = decoded_dict.copy()
+                    frame_dict["data"] = decoded_tiles[frame_index].contiguous()
+                    frame_dict["tiles_shape"] = [
+                        1,
+                        tiles_shape[1],
+                        tiles_shape[2],
+                        tiles_shape[3],
+                    ]
+                    frame_dict["shape"] = torch.Size([padded_height, padded_width])
+                    frame_dict = single_pipeline.steps[-2].backward(frame_dict)
+
+                    frame_dict["data"] = frame_dict["data"][:height, :width]
+                    row_start = frame_index * rows_per_frame
+                    row_end = row_start + rows_per_frame
+                    frame_dict["scale"] = scale[row_start:row_end]
+                    frame_dict["offset"] = offset[row_start:row_end]
+                    frame_dict = _slice_outliers_for_frame(
+                        frame_dict,
+                        frame_index,
+                        rows_per_frame,
+                        group_size,
+                    )
+
+                    frame_dict["shape"] = torch.Size([height, width])
+                    frame_dict = single_pipeline.steps[-3].backward(frame_dict)
+                    frame_dict = single_pipeline.steps[-4].backward(frame_dict)
+                    restored = frame_dict["data"]
+                    if not torch.isfinite(restored).all().item():
+                        raise RuntimeError(
+                            "validation decoded non-finite activation "
+                            f"frame={frame_index}"
+                        )
+                    del frame_dict, restored
+
+                del decoded_dict, decoded_tiles
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+        except Exception:
             raise
 
     def decompress_sequence_frame(

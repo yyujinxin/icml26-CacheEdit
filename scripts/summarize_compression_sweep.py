@@ -144,6 +144,7 @@ def build_rows(output_root: Path, metrics_dir: Path) -> list[dict[str, Any]]:
                 "configured_gop_length",
                 parsed.get("gop_length"),
             ),
+            "gop_start_layer": comp.get("configured_gop_start_layer", 0),
             "frame_interval_p": comp.get(
                 "configured_frame_interval_p",
                 parsed.get("frame_interval_p"),
@@ -163,11 +164,37 @@ def build_rows(output_root: Path, metrics_dir: Path) -> list[dict[str, Any]]:
             "failure_count": comp.get("failure_count"),
             "rc_mode": comp.get("rc_mode"),
             "const_qp": comp.get("const_qp"),
+            "const_qp_intra": comp.get("const_qp_intra"),
+            "const_qp_inter_p": comp.get("const_qp_inter_p"),
+            "const_qp_inter_b": comp.get("const_qp_inter_b"),
             "bitrate_max_multiplier": comp.get("bitrate_max_multiplier"),
+            "codec_preset": comp.get("codec_preset"),
+            "codec_tuning": comp.get("codec_tuning"),
+            "codec_spatial_aq": comp.get("codec_spatial_aq"),
+            "codec_temporal_aq": comp.get("codec_temporal_aq"),
+            "codec_target_quality": comp.get("codec_target_quality"),
+            "quality_steps": json.dumps(
+                comp.get("quality_steps") or [],
+                ensure_ascii=False,
+            ),
+            "quality_streams": json.dumps(
+                comp.get("quality_streams") or [],
+                ensure_ascii=False,
+            ),
+            "quality_codec": comp.get("quality_codec"),
+            "quality_rc_mode": comp.get("quality_rc_mode"),
+            "quality_const_qp": comp.get("quality_const_qp"),
+            "quality_bitrate_mbps": comp.get("quality_bitrate_mbps"),
+            "success_count_by_profile": json.dumps(
+                comp.get("success_count_by_profile") or {},
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
             "quant_outlier_ratio": comp.get(
                 "quant_outlier_ratio",
                 parsed.get("quant_outlier_ratio"),
             ),
+            "codec_residual_ratio": comp.get("codec_residual_ratio"),
             "avg_round_time_s": timings.get("avg_round_time"),
             "payload_compression_ratio": comp.get("payload_compression_ratio"),
             "total_compression_ratio": comp.get("total_compression_ratio"),
@@ -294,16 +321,45 @@ def main() -> int:
             "compression_bitrate": best_quality.get("bitrate_mbps"),
             "compression_rc_mode": best_quality.get("rc_mode"),
             "compression_const_qp": best_quality.get("const_qp"),
+            "compression_const_qp_intra": best_quality.get("const_qp_intra"),
+            "compression_const_qp_inter_p": best_quality.get(
+                "const_qp_inter_p"
+            ),
+            "compression_const_qp_inter_b": best_quality.get(
+                "const_qp_inter_b"
+            ),
             "compression_bitrate_max_multiplier": best_quality.get(
                 "bitrate_max_multiplier"
             ),
+            "compression_codec_preset": best_quality.get("codec_preset"),
+            "compression_codec_tuning": best_quality.get("codec_tuning"),
+            "compression_codec_spatial_aq": best_quality.get(
+                "codec_spatial_aq"
+            ),
+            "compression_codec_temporal_aq": best_quality.get(
+                "codec_temporal_aq"
+            ),
+            "compression_codec_target_quality": best_quality.get(
+                "codec_target_quality"
+            ),
+            "compression_quality_steps": best_quality.get("quality_steps"),
+            "compression_quality_streams": best_quality.get("quality_streams"),
+            "compression_quality_codec": best_quality.get("quality_codec"),
+            "compression_quality_rc_mode": best_quality.get("quality_rc_mode"),
+            "compression_quality_const_qp": best_quality.get(
+                "quality_const_qp"
+            ),
             "compression_gop_length": best_quality.get("gop_length"),
+            "compression_gop_start_layer": best_quality.get("gop_start_layer"),
             "compression_frame_interval_p": best_quality.get("frame_interval_p"),
             "compression_quant_group_size": best_quality.get(
                 "quant_group_size"
             ),
             "compression_quant_outlier_ratio": best_quality.get(
                 "quant_outlier_ratio"
+            ),
+            "compression_codec_residual_ratio": best_quality.get(
+                "codec_residual_ratio"
             ),
         },
         "recommended_for_ratio_under_quality_gate": (
@@ -314,10 +370,52 @@ def main() -> int:
                 "compression_bitrate": best_ratio_gated.get("bitrate_mbps"),
                 "compression_rc_mode": best_ratio_gated.get("rc_mode"),
                 "compression_const_qp": best_ratio_gated.get("const_qp"),
+                "compression_const_qp_intra": best_ratio_gated.get(
+                    "const_qp_intra"
+                ),
+                "compression_const_qp_inter_p": best_ratio_gated.get(
+                    "const_qp_inter_p"
+                ),
+                "compression_const_qp_inter_b": best_ratio_gated.get(
+                    "const_qp_inter_b"
+                ),
                 "compression_bitrate_max_multiplier": best_ratio_gated.get(
                     "bitrate_max_multiplier"
                 ),
+                "compression_codec_preset": best_ratio_gated.get(
+                    "codec_preset"
+                ),
+                "compression_codec_tuning": best_ratio_gated.get(
+                    "codec_tuning"
+                ),
+                "compression_codec_spatial_aq": best_ratio_gated.get(
+                    "codec_spatial_aq"
+                ),
+                "compression_codec_temporal_aq": best_ratio_gated.get(
+                    "codec_temporal_aq"
+                ),
+                "compression_codec_target_quality": best_ratio_gated.get(
+                    "codec_target_quality"
+                ),
+                "compression_quality_steps": best_ratio_gated.get(
+                    "quality_steps"
+                ),
+                "compression_quality_streams": best_ratio_gated.get(
+                    "quality_streams"
+                ),
+                "compression_quality_codec": best_ratio_gated.get(
+                    "quality_codec"
+                ),
+                "compression_quality_rc_mode": best_ratio_gated.get(
+                    "quality_rc_mode"
+                ),
+                "compression_quality_const_qp": best_ratio_gated.get(
+                    "quality_const_qp"
+                ),
                 "compression_gop_length": best_ratio_gated.get("gop_length"),
+                "compression_gop_start_layer": best_ratio_gated.get(
+                    "gop_start_layer"
+                ),
                 "compression_frame_interval_p": best_ratio_gated.get(
                     "frame_interval_p"
                 ),
@@ -326,6 +424,9 @@ def main() -> int:
                 ),
                 "compression_quant_outlier_ratio": best_ratio_gated.get(
                     "quant_outlier_ratio"
+                ),
+                "compression_codec_residual_ratio": best_ratio_gated.get(
+                    "codec_residual_ratio"
                 ),
             }
         ),
